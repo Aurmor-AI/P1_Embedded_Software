@@ -1,0 +1,14 @@
+{
+  "name": "dw3000_regs",
+  "version": "0.1.0",
+  "description": "DW3000 register definitions only — no driver code",
+  "build": {
+    "srcFilter": [
+      "-<*>"
+    ],
+    "flags": [
+      "-Idwt_uwb_driver/dw3000",
+      "-Idwt_uwb_driver"
+    ]
+  }
+}
