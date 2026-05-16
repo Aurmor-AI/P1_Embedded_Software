@@ -10,6 +10,7 @@
 #include "uwb_ranging.h"
 #include "freertos/semphr.h"
 #include <math.h>
+#include "port.h"
 extern "C" {
     #include "deca_device_api.h"
 }
@@ -26,7 +27,7 @@ static const char *TAG = "main";
 
 // Set this per-board: one as INITIATOR, the other as RESPONDER.
 // You can flash the same firmware to both and just change this define.
-#define MY_UWB_ROLE  UWB_ROLE_INITIATOR
+#define MY_UWB_ROLE  UWB_ROLE_RESPONDER// UWB_ROLE_RESPONDER or UWB_ROLE_INITIATOR
 
 // Task rates
 #define IMU_PRINT_HZ      10
@@ -186,18 +187,13 @@ static void boot_reset_peripherals(void)
 // ===========================================================================
 extern "C" void app_main(void)
 {
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    vTaskDelay(pdMS_TO_TICKS(4000));
     ESP_LOGI(TAG, "=== Boot ===");
 
     boot_reset_peripherals();
 
-    // --- DWM3000 ---
-    if (dwm3000_init(PIN_MOSI, PIN_MISO, PIN_SCLK, PIN_CS, PIN_RST) != ESP_OK) {
-        ESP_LOGE(TAG, "DWM3000 init failed");
-        return;
-    }
 
-    if (uwb_init(MY_UWB_ROLE) != ESP_OK) {
+    if (uwb_init(MY_UWB_ROLE, PIN_MOSI, PIN_MISO, PIN_SCLK, PIN_CS, PIN_RST) != ESP_OK) {
         ESP_LOGE(TAG, "UWB init failed");
         return;
     }
