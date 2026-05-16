@@ -1,6 +1,8 @@
 #include <stdio.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -8,8 +10,6 @@
 #include "dwm3000.h"
 #include "lsm6dsv.h"
 #include "uwb_ranging.h"
-#include "freertos/semphr.h"
-#include <math.h>
 #include "port.h"
 extern "C" {
     #include "deca_device_api.h"
@@ -26,147 +26,232 @@ static const char *TAG = "main";
 #define PIN_SCL  23
 
 // Set this per-board: one as INITIATOR, the other as RESPONDER.
-// You can flash the same firmware to both and just change this define.
-#define MY_UWB_ROLE  UWB_ROLE_RESPONDER// UWB_ROLE_RESPONDER or UWB_ROLE_INITIATOR
+// Flash the same firmware to both and just change this define.
+#define MY_UWB_ROLE  UWB_ROLE_RESPONDER // UWB_ROLE_RESPONDER or UWB_ROLE_INITIATOR
 
-// Task rates
+// Sampling and reporting rates
+#define IMU_SAMPLE_HZ     200
 #define IMU_PRINT_HZ      10
 #define UWB_RANGE_HZ      10
-#define IMU_PERIOD_MS     (1000 / IMU_PRINT_HZ)
-#define UWB_PERIOD_MS     (1000 / UWB_RANGE_HZ)
 
-#define SAMPLE_PERIOD_MS  20  // 50 Hz print rate
+#define IMU_SAMPLE_PERIOD_US (1000000 / IMU_SAMPLE_HZ)
+#define IMU_PRINT_PERIOD_MS  (1000 / IMU_PRINT_HZ)
+#define UWB_PERIOD_MS        (1000 / UWB_RANGE_HZ)
 
-// Shared state — protected by atomic-ish access (single writer, single reader is OK
-// for floats on 32-bit MCUs without explicit synchronization)
-static uwb_range_result_t s_last_range = {0.0f, 0, false};
-static SemaphoreHandle_t s_range_mutex = NULL;
+// ---------------------------------------------------------------------------
+// Shared state — UWB task writes, IMU task reads.
+//
+// Protected by a portMUX_TYPE spinlock. The struct is small (~16 bytes) and
+// contention is essentially zero (UWB writes at 10 Hz, IMU reads at 10 Hz),
+// so a spinlock is faster and simpler than a mutex and never blocks.
+// ---------------------------------------------------------------------------
+static uwb_range_result_t s_last_range = { 0.0f, 0, false };
+static portMUX_TYPE       s_range_lock = portMUX_INITIALIZER_UNLOCKED;
 
-// ===========================================================================
-// IMU task — reads sample, prints combined IMU + ranging data
-// ===========================================================================
-static void imu_task(void *arg)
+static inline void range_publish(const uwb_range_result_t *r) {
+    portENTER_CRITICAL(&s_range_lock);
+    s_last_range = *r;
+    portEXIT_CRITICAL(&s_range_lock);
+}
+
+static inline void range_invalidate(void) {
+    portENTER_CRITICAL(&s_range_lock);
+    s_last_range.valid = false;
+    portEXIT_CRITICAL(&s_range_lock);
+}
+
+static inline uwb_range_result_t range_snapshot(void) {
+    uwb_range_result_t r;
+    portENTER_CRITICAL(&s_range_lock);
+    r = s_last_range;
+    portEXIT_CRITICAL(&s_range_lock);
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// IMU sampling: esp_timer pushes samples into a queue at exactly IMU_SAMPLE_HZ.
+// The print task drains the queue, tracks peak high-g, and prints at 10 Hz.
+//
+// Queue depth = 2 * sample rate / print rate gives one full print interval
+// of headroom in case the print task gets preempted.
+// ---------------------------------------------------------------------------
+#define IMU_QUEUE_DEPTH ((IMU_SAMPLE_HZ / IMU_PRINT_HZ) * 2)
+
+static QueueHandle_t      s_imu_q       = NULL;
+static esp_timer_handle_t s_imu_timer   = NULL;
+static volatile uint32_t  s_imu_dropped = 0;
+
+static void imu_timer_cb(void *arg)
 {
-    ESP_LOGI(TAG, "IMU task started");
-    // ... [printf headers stay the same] ...
+    // esp_timer with TASK dispatch runs in the timer's own task context,
+    // not an ISR — I2C transactions are safe here.
+    lsm6_sample_t s;
+    if (lsm6_read_sample(&s) != ESP_OK) return;
 
-    int64_t next_print = esp_timer_get_time();
-    int64_t next_sample = esp_timer_get_time();
+    // Non-blocking send. If the queue is full, drop the oldest sample to
+    // keep newest data flowing rather than backing up the timer.
+    if (xQueueSend(s_imu_q, &s, 0) != pdTRUE) {
+        lsm6_sample_t discard;
+        xQueueReceive(s_imu_q, &discard, 0);
+        xQueueSend(s_imu_q, &s, 0);
+        s_imu_dropped++;
+    }
+}
 
-    // Peak tracker for high-g
-    float peak_h_mag = 0.0f;
-    lsm6_sample_t peak_sample = {};
+// ---------------------------------------------------------------------------
+// IMU print task — drains the queue, tracks windowed peak high-g, prints
+// at IMU_PRINT_HZ. Also tracks an all-time peak across the session.
+// ---------------------------------------------------------------------------
+static void imu_print_task(void *arg)
+{
+    ESP_LOGI(TAG, "IMU print task started (sample=%d Hz, print=%d Hz)",
+             IMU_SAMPLE_HZ, IMU_PRINT_HZ);
+
+    printf("# t_ms      | ax        ay        az       | "
+           "hx       hy       hz       | "
+           "gx        gy        gz        | temp | peak_h | all_peak | range\n");
+
+    TickType_t next_print = xTaskGetTickCount() + pdMS_TO_TICKS(IMU_PRINT_PERIOD_MS);
+
+    // Windowed peak (resets each print interval)
+    float         window_peak_g      = 0.0f;
+    lsm6_sample_t window_peak_sample = {};
+    bool          window_has_sample  = false;
+
+    // All-time peak (resets only on boot)
+    float all_time_peak_g = 0.0f;
 
     while (true) {
-        int64_t now = esp_timer_get_time();
-
-        // Sample at high rate
-        if (now >= next_sample) {
-            lsm6_sample_t s;
-            if (lsm6_read_sample(&s) == ESP_OK) {
-                // Track peak high-g magnitude
-                float h_mag = sqrtf(s.hx_g * s.hx_g +
-                                    s.hy_g * s.hy_g +
-                                    s.hz_g * s.hz_g);
-                if (h_mag > peak_h_mag) {
-                    peak_h_mag = h_mag;
-                    peak_sample = s;
-                }
-            }
-            next_sample += 5000;  // 200 Hz sampling
+        // Compute time until next print deadline. If we're past it,
+        // skip straight to printing. Otherwise, block on the queue for
+        // at most that long, so we yield CPU when no samples arrive.
+        TickType_t now = xTaskGetTickCount();
+        TickType_t wait_ticks;
+        if ((int32_t)(now - next_print) >= 0) {
+            wait_ticks = 0;
+        } else {
+            wait_ticks = next_print - now;
+            // Guarantee at least 1 tick of yielding when we do block,
+            // even if the deadline rounds down to 0 ticks. This is the
+            // anti-spin guarantee.
+            if (wait_ticks == 0) wait_ticks = 1;
         }
 
-        // Print at slower rate
-        if (now >= next_print) {
-            int64_t now_ms = now / 1000;
-
-            uwb_range_result_t r;
-            if (xSemaphoreTake(s_range_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-                r = s_last_range;
-                xSemaphoreGive(s_range_mutex);
-            } else {
-                r.valid = false;
+        lsm6_sample_t s;
+        if (xQueueReceive(s_imu_q, &s, wait_ticks) == pdTRUE) {
+            float h_mag = sqrtf(s.hx_g * s.hx_g +
+                                s.hy_g * s.hy_g +
+                                s.hz_g * s.hz_g);
+            if (!window_has_sample || h_mag > window_peak_g) {
+                window_peak_g      = h_mag;
+                window_peak_sample = s;
+                window_has_sample  = true;
             }
-            char range_str[16];
-            if (r.valid) snprintf(range_str, sizeof(range_str), "%7.3f", r.distance_m);
-            else snprintf(range_str, sizeof(range_str), "   ---");
-
-            // Print using the peak high-g sample from this interval
-            printf("%-10lld | %+8.3f %+8.3f %+8.3f | "
-                   "%+8.2f %+8.2f %+8.2f | "
-                   "%+9.2f %+9.2f %+9.2f | %5.1f | peak_h=%5.2fg | %s\n",
-                   now_ms,
-                   peak_sample.ax_g, peak_sample.ay_g, peak_sample.az_g,
-                   peak_sample.hx_g, peak_sample.hy_g, peak_sample.hz_g,
-                   peak_sample.gx_dps, peak_sample.gy_dps, peak_sample.gz_dps,
-                   peak_sample.temp_c,
-                   peak_h_mag,
-                   range_str);
-
-            // Reset peak for next interval
-            peak_h_mag = 0.0f;
-
-            next_print += 100000;  // 100 ms = 10 Hz print rate
+            if (h_mag > all_time_peak_g) {
+                all_time_peak_g = h_mag;
+            }
+            // Loop back; we may still have time before the deadline.
+            continue;
         }
 
-        // Sleep until next event (sample or print, whichever comes first)
-        int64_t sleep_us = next_sample < next_print ? next_sample - now
-                                                    : next_print - now;
-        if (sleep_us > 0) {
-            vTaskDelay(pdMS_TO_TICKS(sleep_us / 1000 + 1));
+        // xQueueReceive returned false. Either the deadline arrived
+        // (wait_ticks expired) or no sample showed up. Either way,
+        // it's time to evaluate whether to print.
+        if ((int32_t)(xTaskGetTickCount() - next_print) < 0) {
+            // Spurious wake-up (shouldn't happen, but be defensive).
+            continue;
+        }
+
+        // Advance the deadline. If we've fallen far behind (e.g. due to
+        // a long log stall), snap forward to "now" rather than spamming
+        // catch-up prints.
+        next_print += pdMS_TO_TICKS(IMU_PRINT_PERIOD_MS);
+        if ((int32_t)(xTaskGetTickCount() - next_print) > pdMS_TO_TICKS(IMU_PRINT_PERIOD_MS)) {
+            next_print = xTaskGetTickCount() + pdMS_TO_TICKS(IMU_PRINT_PERIOD_MS);
+        }
+
+        if (!window_has_sample) {
+            // No samples this interval — log once, then move on without
+            // burning CPU. The next iteration will block on the queue
+            // for the full print interval.
+            static int empty_logged = 0;
+            if (empty_logged++ < 5) {
+                ESP_LOGW(TAG, "No IMU samples in last %d ms — timer or I2C stalled?",
+                         IMU_PRINT_PERIOD_MS);
+            }
+            continue;
+        }
+
+        uwb_range_result_t r = range_snapshot();
+        char range_str[16];
+        if (r.valid) snprintf(range_str, sizeof(range_str), "%7.3f", r.distance_m);
+        else         snprintf(range_str, sizeof(range_str), "   ---");
+
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        const lsm6_sample_t &p = window_peak_sample;
+        printf("%-10lld | %+8.3f %+8.3f %+8.3f | "
+               "%+8.2f %+8.2f %+8.2f | "
+               "%+9.2f %+9.2f %+9.2f | %5.1f | %5.2fg | %6.2fg  | %s\n",
+               now_ms,
+               p.ax_g, p.ay_g, p.az_g,
+               p.hx_g, p.hy_g, p.hz_g,
+               p.gx_dps, p.gy_dps, p.gz_dps,
+               p.temp_c,
+               window_peak_g, all_time_peak_g,
+               range_str);
+
+        // Reset window
+        window_peak_g     = 0.0f;
+        window_has_sample = false;
+
+        // Periodic drop report
+        static uint32_t last_dropped_logged = 0;
+        if (s_imu_dropped != last_dropped_logged) {
+            ESP_LOGW(TAG, "IMU queue drops: %lu (cumulative)",
+                     (unsigned long)s_imu_dropped);
+            last_dropped_logged = s_imu_dropped;
         }
     }
 }
 
-// ===========================================================================
-// UWB task — performs ranging, updates shared state
-// ===========================================================================
+// ---------------------------------------------------------------------------
+// UWB task — performs ranging, updates shared state.
+// ---------------------------------------------------------------------------
 static void uwb_task(void *arg)
 {
     ESP_LOGI(TAG, "UWB task started (role: %s)",
              MY_UWB_ROLE == UWB_ROLE_INITIATOR ? "initiator" : "responder");
 
-    int64_t next = esp_timer_get_time();
-    int fail_count = 0;
+    TickType_t next = xTaskGetTickCount();
+    int        consecutive_fails = 0;
 
     while (true) {
         uwb_range_result_t r;
         esp_err_t err = uwb_perform_ranging(&r);
 
-        if (xSemaphoreTake(s_range_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
         if (err == ESP_OK && r.valid) {
-            s_last_range = r;
-            fail_count = 0;
+            range_publish(&r);
+            consecutive_fails = 0;
         } else {
-            if (++fail_count == 1) {
-                ESP_LOGW(TAG, "Ranging not yet implemented (stub returns ERR)");
+            consecutive_fails++;
+            if (consecutive_fails == 5) {
+                range_invalidate();
+                ESP_LOGW(TAG, "5 consecutive ranging failures, marking invalid");
             }
-            if (fail_count > 5) {
-                s_last_range.valid = false;
-            }
-        }
-        xSemaphoreGive(s_range_mutex);
         }
 
-        next += UWB_PERIOD_MS * 1000;
-        int64_t now = esp_timer_get_time();
-        int64_t sleep_us = next - now;
-        if (sleep_us > 0) {
-            vTaskDelay(pdMS_TO_TICKS(sleep_us / 1000));
-        } else {
-            next = now;
-        }
+        vTaskDelayUntil(&next, pdMS_TO_TICKS(UWB_PERIOD_MS));
     }
 }
 
-// ===========================================================================
+// ---------------------------------------------------------------------------
 // Boot-time peripheral reset
-// ===========================================================================
+// ---------------------------------------------------------------------------
 static void boot_reset_peripherals(void)
 {
     ESP_LOGI(TAG, "Resetting peripherals...");
 
-    // Force IMU into I2C mode (in case it's stuck in I3C)
+    // Force IMU out of any stale I3C state
     lsm6_force_i2c_mode(PIN_SDA, PIN_SCL);
 
     // Hard-reset DWM3000
@@ -182,9 +267,9 @@ static void boot_reset_peripherals(void)
     lsm6_deinit();
 }
 
-// ===========================================================================
-// app_main — initialize everything, hand off to tasks
-// ===========================================================================
+// ---------------------------------------------------------------------------
+// app_main
+// ---------------------------------------------------------------------------
 extern "C" void app_main(void)
 {
     vTaskDelay(pdMS_TO_TICKS(4000));
@@ -192,7 +277,7 @@ extern "C" void app_main(void)
 
     boot_reset_peripherals();
 
-
+    // --- UWB ---
     if (uwb_init(MY_UWB_ROLE, PIN_MOSI, PIN_MISO, PIN_SCLK, PIN_CS, PIN_RST) != ESP_OK) {
         ESP_LOGE(TAG, "UWB init failed");
         return;
@@ -216,17 +301,33 @@ extern "C" void app_main(void)
         return;
     }
 
-    // --- Create mutex (MUST be before xTaskCreate) ---
-    s_range_mutex = xSemaphoreCreateMutex();
-    if (s_range_mutex == NULL) {
-        ESP_LOGE(TAG, "Failed to create mutex");
+    // --- IMU sample queue + timer ---
+    s_imu_q = xQueueCreate(IMU_QUEUE_DEPTH, sizeof(lsm6_sample_t));
+    if (s_imu_q == NULL) {
+        ESP_LOGE(TAG, "Failed to create IMU queue");
         return;
     }
-    ESP_LOGI(TAG, "Mutex created");
 
-    // --- Launch tasks ---
-    xTaskCreate(imu_task, "imu_task", 4096, NULL, 5, NULL);
-    xTaskCreate(uwb_task, "uwb_task", 4096, NULL, 5, NULL);
+    const esp_timer_create_args_t timer_args = {
+        .callback              = &imu_timer_cb,
+        .arg                   = NULL,
+        .dispatch_method       = ESP_TIMER_TASK,
+        .name                  = "imu_sample",
+        .skip_unhandled_events = true,
+    };
+    if (esp_timer_create(&timer_args, &s_imu_timer) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create IMU timer");
+        return;
+    }
+    if (esp_timer_start_periodic(s_imu_timer, IMU_SAMPLE_PERIOD_US) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start IMU timer");
+        return;
+    }
+    ESP_LOGI(TAG, "IMU timer running at %d us period", IMU_SAMPLE_PERIOD_US);
+
+    // --- Tasks ---
+    xTaskCreate(imu_print_task, "imu_print", 4096, NULL, 5, NULL);
+    xTaskCreate(uwb_task,       "uwb",       4096, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "Tasks running. app_main exiting.");
 }

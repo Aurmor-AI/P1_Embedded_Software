@@ -51,8 +51,12 @@ static void st_platform_delay(uint32_t ms)
     vTaskDelay(pdMS_TO_TICKS(ms));
 }
 
-// Driver context — initialized in lsm6_configure_default
+// Driver context — initialized in lsm6_read_who_am_i as soon as we have
+// a valid I2C device handle. Tracked separately so lsm6_read_sample can
+// refuse to run if configure_default hasn't completed.
 static stmdev_ctx_t s_st_ctx;
+static bool s_st_ctx_ready = false;
+static bool s_configured = false;
 
 static esp_err_t reg_write(uint8_t reg, uint8_t val)
 {
@@ -102,6 +106,8 @@ esp_err_t lsm6_deinit(void)
         s_bus = NULL;
     }
     s_addr = 0;
+    s_st_ctx_ready = false;
+    s_configured = false;
     return ESP_OK;
 }
 
@@ -150,6 +156,16 @@ esp_err_t lsm6_read_who_am_i(uint8_t *out_addr, uint8_t *out_whoami)
             s_addr = addrs[i];
             *out_addr = addrs[i];
             *out_whoami = whoami;
+
+            // Wire up the ST driver context immediately — any code path
+            // that has a working I2C device should be able to use it.
+            s_st_ctx.write_reg = st_platform_write;
+            s_st_ctx.read_reg  = st_platform_read;
+            s_st_ctx.mdelay    = st_platform_delay;
+            s_st_ctx.handle    = s_dev;
+            s_st_ctx_ready = true;
+            s_configured = false;  // configure_default must run before sampling
+
             return ESP_OK;
         } else {
             i2c_master_bus_rm_device(dev);
@@ -160,13 +176,7 @@ esp_err_t lsm6_read_who_am_i(uint8_t *out_addr, uint8_t *out_whoami)
 
 esp_err_t lsm6_configure_default(void)
 {
-    if (s_dev == NULL) return ESP_ERR_INVALID_STATE;
-
-    // Wire up ST driver context to our I2C device
-    s_st_ctx.write_reg = st_platform_write;
-    s_st_ctx.read_reg = st_platform_read;
-    s_st_ctx.mdelay = st_platform_delay;
-    s_st_ctx.handle = s_dev;
+    if (s_dev == NULL || !s_st_ctx_ready) return ESP_ERR_INVALID_STATE;
 
     // Verify chip ID via ST driver (sanity check that shim works)
     uint8_t whoami;
@@ -214,12 +224,16 @@ esp_err_t lsm6_configure_default(void)
     ESP_LOGI(TAG, "ST: gyro 960Hz ±4000dps HP");
 
     vTaskDelay(pdMS_TO_TICKS(100));
+    s_configured = true;
     return ESP_OK;
 }
 
 esp_err_t lsm6_read_sample(lsm6_sample_t *out)
 {
-    if (s_dev == NULL || out == NULL) return ESP_ERR_INVALID_ARG;
+    if (out == NULL) return ESP_ERR_INVALID_ARG;
+    if (s_dev == NULL || !s_st_ctx_ready || !s_configured) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
     int16_t raw_a[3], raw_h[3], raw_g[3];
 
@@ -240,15 +254,6 @@ esp_err_t lsm6_read_sample(lsm6_sample_t *out)
     out->gx_dps = raw_g[0] * s_gyro_sens_dps_per_lsb;
     out->gy_dps = raw_g[1] * s_gyro_sens_dps_per_lsb;
     out->gz_dps = raw_g[2] * s_gyro_sens_dps_per_lsb;
-
-    // Diagnostic: log raw values periodically
-    static int counter = 0;
-    if (++counter >= 10) {
-        counter = 0;
-        // ESP_LOGI(TAG, "RAW low-g: %+6d %+6d %+6d | high-g: %+6d %+6d %+6d",
-        //          raw_a[0], raw_a[1], raw_a[2],
-        //          raw_h[0], raw_h[1], raw_h[2]);
-    }
 
     int16_t temp_raw;
     if (lsm6dsv80x_temperature_raw_get(&s_st_ctx, &temp_raw) != 0) return ESP_FAIL;
@@ -319,4 +324,3 @@ void lsm6_force_i2c_mode(int sda, int scl)
     gpio_set_direction((gpio_num_t)scl, GPIO_MODE_INPUT);
     vTaskDelay(pdMS_TO_TICKS(2));
 }
-
