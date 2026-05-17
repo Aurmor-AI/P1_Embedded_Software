@@ -13,9 +13,9 @@ typedef enum {
 } uwb_role_t;
 
 typedef struct {
-    /* Distance in meters after applying g_uwb_distance_offset_m. Valid only
-     * when .valid is true. Negative values can occur very close in if the
-     * calibration offset is too large; that's expected. */
+    /* Distance in meters after applying g_uwb_distance_offset_m. Valid
+     * only when .valid is true. Negative values can occur very close in
+     * if the calibration offset is too large; that's expected. */
     float   distance_m;
     int64_t timestamp_us;
     bool    valid;
@@ -23,15 +23,15 @@ typedef struct {
 
 esp_err_t uwb_init(uwb_role_t role, int mosi, int miso, int sclk, int cs, int rst);
 
-/* Performs one SS-TWR cycle.
+/* Performs one DS-TWR cycle.
  *
- * Initiator: sends Poll, waits for Response, computes distance, sends Final
- * containing the distance for the responder. On success, *result has the
- * locally computed distance.
+ * Four-frame exchange:
+ *   Initiator:  Poll TX -> Response RX -> Final TX (with timestamps) -> Report RX
+ *   Responder:  Poll RX -> Response TX -> Final RX (read timestamps,
+ *                 compute DS-TWR ToF) -> Report TX (with distance)
  *
- * Responder: waits for Poll, sends Response containing its timestamps, then
- * waits for Final to receive the distance. On success, *result has the
- * distance the initiator computed and shared back.
+ * On success, *result is populated on BOTH ends with the responder's
+ * computed distance (initiator gets it via the Report frame).
  *
  * Returns ESP_OK whether or not the cycle completed end-to-end — check
  * result->valid for that. Returns an error only on driver/SPI failure. */

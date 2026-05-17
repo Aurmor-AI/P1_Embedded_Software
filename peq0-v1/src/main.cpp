@@ -27,7 +27,7 @@ static const char *TAG = "main";
 
 // Set this per-board: one as INITIATOR, the other as RESPONDER.
 // Flash the same firmware to both and just change this define.
-#define MY_UWB_ROLE  UWB_ROLE_RESPONDER // UWB_ROLE_RESPONDER or UWB_ROLE_INITIATOR
+#define MY_UWB_ROLE  UWB_ROLE_INITIATOR// UWB_ROLE_RESPONDER or UWB_ROLE_INITIATOR
 
 // Sampling and reporting rates
 #define IMU_SAMPLE_HZ     200

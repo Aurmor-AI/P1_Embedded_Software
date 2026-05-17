@@ -1,33 +1,43 @@
-/* uwb_ranging.c — SS-TWR with three frames (Poll / Response / Final)
+/* uwb_ranging.c — Double-Sided Two-Way Ranging (DS-TWR)
  *
  * Frame sequence:
  *
- *   Initiator                          Responder
- *      |                                   |
- *      |--- Poll ------------------------->|  (magic, seq)
- *      |                                   |  reads poll_rx_ts
- *      |<-- Response ----------------------|  (magic, seq, poll_rx_ts, resp_tx_ts)
- *      |   reads resp_rx_ts                |
- *      |   computes ToF -> distance        |
- *      |--- Final ------------------------>|  (magic, seq, distance_mm)
- *      |                                   |  stores distance
+ *   Initiator                            Responder
+ *      |                                     |
+ *      |--- Poll -------------------------->|   reads poll_rx_ts
+ *      |<-- Response -----------------------|   (poll_rx_ts, resp_tx_ts)
+ *      |   reads resp_rx_ts                  |   scheduled via delayed TX
+ *      |--- Final ------------------------->|   reads final_rx_ts
+ *      |   includes [poll_tx, resp_rx,       |   computes DS-TWR ToF
+ *      |             final_tx]               |
+ *      |<-- Report -------------------------|   (distance_mm)
+ *      |   stores distance                   |
  *
- * Why three frames instead of two: the responder cannot compute distance on
- * its own (it doesn't see the initiator's poll_tx or resp_rx), so the
- * initiator shares its result back. The Final is a short fire-and-forget
- * frame; the responder uses RX-after-TX to catch it.
+ * Why DS-TWR over SS-TWR:
+ *   - SS-TWR computes ToF = (Ra - Db) / 2 where Ra uses initiator clock
+ *     and Db uses responder clock. Clock drift between the two adds a
+ *     systematic error proportional to the reply delay (~18 mm/ms at
+ *     20 ppm clock skew). With our 3 ms reply delays, that's tens of cm.
  *
- * TX/RX state machine — the critical bit that broke the previous version:
+ *   - DS-TWR uses (Ra*Rb - Da*Db) / (Ra+Rb+Da+Db). Drift terms cancel
+ *     to first order, leaving residual error in the cm range or better.
  *
- *   Initiator: TX Poll (DWT_RESPONSE_EXPECTED) → HW arms RX → wait RXFCG →
- *              read Response → TX Final (no RX expected) → done.
+ * Formula derivation (Qorvo "asymmetric DS-TWR"):
+ *   Ra = resp_rx_ts - poll_tx_ts         (initiator round-trip 1)
+ *   Rb = final_rx_ts - resp_tx_ts        (responder round-trip)
+ *   Da = final_tx_ts - resp_rx_ts        (initiator reply delay)
+ *   Db = resp_tx_ts - poll_rx_ts         (responder reply delay)
+ *   ToF = (Ra * Rb - Da * Db) / (Ra + Rb + Da + Db)
  *
- *   Responder: RX (forever) → got Poll → TX Response (DWT_RESPONSE_EXPECTED)
- *              → HW arms RX → wait RXFCG → read Final → done.
+ *   Distance = ToF * speed_of_light * tick_period.
  *
- * Using DWT_RESPONSE_EXPECTED + dwt_setrxaftertxdelay means the chip arms
- * RX in hardware as part of TX completion. No software gap. Polling-based
- * RX-enable after TX is too slow to catch the partner's response on PLEN 64.
+ * Two scheduled-TX gotchas (both apply on both ends):
+ *   - dwt_setdelayedtrxtime takes timestamp >> 8 (top 32 bits of a
+ *     40-bit value).
+ *   - The hardware ALSO zeros bit 0 of that value (= bit 8 of timestamp).
+ *     So the embedded TX timestamp must mask with & 0xFFFFFFFEUL before
+ *     shifting back. Skipping this gives a 256-tick alternating error
+ *     (~0.6 m bimodal distance, halved by ToF math).
  */
 
 #include "uwb_ranging.h"
@@ -49,106 +59,91 @@ static const char *TAG = "uwb";
 
 /* Antenna delay (in DW3000 ticks ~15.65 ps each). 16385 is Qorvo's stock
  * default for channel 5 — uncalibrated. Run a known-distance calibration
- * to tune this. Off-by-1 here = off by ~0.5 cm in distance. */
+ * once DS-TWR is stable. Off-by-1 here = off by ~0.5 cm in distance. */
 #define TX_ANT_DLY 16385
 #define RX_ANT_DLY 16385
 
-/* Time units. dwt_readsystime / timestamps are in 15.65 ps units (DTU).
- * UWB µs (uus) = 65536 DTU. */
-#define UUS_TO_DWT_TIME 65536
-
-/* Initiator: how long after Poll-TX to enable RX, and how long to wait
- * for Response. Both values are in UWB µs (uus = 65536 DTU = ~1.0256 µs
- * wall-clock). These have to be aligned with the responder's scheduled
- * response TX time below — if the initiator's RX window opens too late
- * or closes too early, you'll see "Resp RX miss" with RXPTO in status.
+/* UWB µs (uus) = 65536 DTU = ~1.0256 µs wall-clock.
  *
- * Sized to comfortably cover ESP-IDF SPI overhead on both ends (~9 SPI
- * transactions between RX-of-Poll and TX-of-Response on the responder). */
-#define POLL_TX_TO_RESP_RX_DLY_UUS  1100
-#define RESP_RX_TIMEOUT_UUS         1200
+ * NOTE: the suffix matters! Without it, expressions like
+ *   POLL_RX_TO_RESP_TX_DLY_UUS * UUS_TO_DWT_TIME
+ * where the delay is >= 32768 overflow signed int (32-bit) and produce
+ * undefined behavior — typically wrapping to a negative number which,
+ * when added to poll_rx_ts as uint64, makes the scheduled time go
+ * backwards. Use the UL suffix to force unsigned-long evaluation. */
+#define UUS_TO_DWT_TIME 65536UL
 
-/* Responder: scheduled delay from poll-RX-timestamp to response-TX. Must
- * exceed the wall-clock time taken for ~9 SPI transactions (frame length,
- * RX data read, RX timestamp read, TX data write, FCTRL, two delay regs,
- * TX-start) plus task scheduling jitter. 1500 uus = ~1.54 ms — generous
- * but safe. If this is too small you'll see "Resp TX delayed-start failed". */
-#define POLL_RX_TO_RESP_TX_DLY_UUS  1500
+/* Initiator: Response RX window after Poll TX. */
+#define POLL_TX_TO_RESP_RX_DLY_UUS  4000
+#define RESP_RX_TIMEOUT_UUS         8000
 
-/* Responder: after Response TX, how long to wait for the Final.
- *
- * The initiator's Final TX fires fairly quickly after Response RX
- * (~1.5 ms of SPI overhead to build and start the Final frame). So
- * the responder's RX window must open early — if it opens too late,
- * the Final's preamble has already passed and we get RXPTO.
- *
- * Open the window immediately (delay=0), keep it open for 4 ms to
- * cover initiator-side SPI jitter. */
+/* Responder: scheduled Response TX delay after Poll RX. ~500 us of host
+ * overhead measured + 1 ms detection jitter + margin = 6 ms. */
+#define POLL_RX_TO_RESP_TX_DLY_UUS  6000
+
+/* Initiator: scheduled Final TX delay after Response RX. */
+#define RESP_RX_TO_FINAL_TX_DLY_UUS 6000
+
+/* Responder: Final RX window after Response TX. Open immediately, keep
+ * open for ~12 ms to absorb initiator-side scheduling jitter. */
 #define RESP_TX_TO_FINAL_RX_DLY_UUS  0
-#define FINAL_RX_TIMEOUT_UUS         4000
+#define FINAL_RX_TIMEOUT_UUS         12000
 
-/* Speed of light in air ≈ 299,702,547 m/s. DW3000 datasheet uses this
- * value for distance computation. */
+/* Initiator: Report RX window after Final TX. */
+#define FINAL_TX_TO_REPORT_RX_DLY_UUS 0
+#define REPORT_RX_TIMEOUT_UUS         8000
+
+/* Speed of light in air ≈ 299,702,547 m/s. */
 #define SPEED_OF_LIGHT_M_PER_S      299702547.0
 
-/* DW3000 timestamp tick period in seconds. 1 / (499.2e6 * 128) ≈ 15.65 ps. */
+/* DW3000 timestamp tick period: 1 / (499.2e6 * 128) ≈ 15.65 ps. */
 #define DWT_TIME_UNITS              (1.0 / 499200000.0 / 128.0)
 
 float g_uwb_distance_offset_m = 0.0f;
 
 /* --------------------------------------------------------------------- */
-/* Frame layout — IEEE 802.15.4 short addressing (PAN-ID + short addr).  */
+/* Frame layout                                                          */
 /* --------------------------------------------------------------------- */
 
-/* Common header (10 bytes):
+/* IEEE 802.15.4 short-address header (10 bytes):
  *   [0..1] frame control (0x88 0x41)
  *   [2]    sequence number
  *   [3..4] PAN ID (0xDECA)
- *   [5..6] dest short address ('W' 'A' or 'V' 'E')
+ *   [5..6] dest short address
  *   [7..8] src  short address
  *   [9]    function code
- *
- * Then function-specific payload, then 2-byte FCS appended by hardware.
- *
- * Magic bytes we check on RX:
- *   - frame control = 0x88 0x41
- *   - PAN ID = 0xDE 0xCA
- *   - function code at byte 9
- *
- * Initiator address = 'V''E'  (V = Vector, E = Initiator-ish, mnemonic only)
- * Responder address = 'W''A'  (anything distinct works)
- */
+ * Then function-specific payload, then 2-byte FCS appended by hardware. */
 
-#define FRAME_FC_0          0x41
-#define FRAME_FC_1          0x88
-#define PAN_ID_LO           0xCA
-#define PAN_ID_HI           0xDE
+#define FRAME_FC_0      0x41
+#define FRAME_FC_1      0x88
+#define PAN_ID_LO       0xCA
+#define PAN_ID_HI       0xDE
 
-#define ADDR_INIT_LO        'V'
-#define ADDR_INIT_HI        'E'
-#define ADDR_RESP_LO        'W'
-#define ADDR_RESP_HI        'A'
+#define ADDR_INIT_LO    'V'
+#define ADDR_INIT_HI    'E'
+#define ADDR_RESP_LO    'W'
+#define ADDR_RESP_HI    'A'
 
-#define FN_POLL             0x21
-#define FN_RESPONSE         0x10
-#define FN_FINAL            0x29
+#define FN_POLL         0x21
+#define FN_RESPONSE     0x10
+#define FN_FINAL        0x29
+#define FN_REPORT       0x2A
 
-#define FCS_LEN             2
+#define FCS_LEN         2
 
-/* Poll: header only (10 bytes) */
-#define POLL_FRAME_LEN      10
-
-/* Response: header + poll_rx_ts(5) + resp_tx_ts(5) = 20 bytes
- * Timestamps are 40-bit DW3000 values, sent low-byte first. */
-#define RESP_FRAME_LEN      20
+#define POLL_FRAME_LEN  10
+/* Response: header + poll_rx_ts(5) + resp_tx_ts(5) */
+#define RESP_FRAME_LEN  20
 #define RESP_POLL_RX_TS_IDX 10
 #define RESP_RESP_TX_TS_IDX 15
-
-/* Final: header + distance_mm(4) = 14 bytes
- * distance_mm is signed int32, little-endian. We use mm so we don't need
- * to send floats over the air. Range fits easily in int32. */
-#define FINAL_FRAME_LEN     14
-#define FINAL_DIST_IDX      10
+/* Final: header + poll_tx_ts(5) + resp_rx_ts(5) + final_tx_ts(5) */
+#define FINAL_FRAME_LEN 25
+#define FINAL_POLL_TX_TS_IDX  10
+#define FINAL_RESP_RX_TS_IDX  15
+#define FINAL_FINAL_TX_TS_IDX 20
+/* Report: header + distance_mm(4) */
+#define REPORT_FRAME_LEN 14
+#define REPORT_DIST_IDX  10
 
 /* --------------------------------------------------------------------- */
 /* State                                                                  */
@@ -174,11 +169,11 @@ static const dwt_config_t s_uwb_config = {
     .rxPAC         = DWT_PAC8,
     .txCode        = 9,
     .rxCode        = 9,
-    .sfdType       = 1,                /* IEEE 802.15.4z 8-bit SFD */
+    .sfdType       = 1,
     .dataRate      = DWT_BR_6M8,
     .phrMode       = DWT_PHRMODE_STD,
     .phrRate       = DWT_PHRRATE_STD,
-    .sfdTO         = (64 + 1 + 8 - 8), /* sfdTO for PLEN 64 */
+    .sfdTO         = (64 + 1 + 8 - 8),
     .stsMode       = DWT_STS_MODE_OFF,
     .stsLength     = DWT_STS_LEN_64,
     .pdoaMode      = DWT_PDOA_M0,
@@ -217,22 +212,19 @@ static void fill_header(uint8_t *frame, uint8_t fn,
     frame[9] = fn;
 }
 
-/* Validate header + function code + sender. Returns true if frame matches
- * what we expected from the peer. Length check is up to the caller. */
 static bool header_ok(const uint8_t *f, uint8_t expected_fn)
 {
     return f[0] == FRAME_FC_0 &&
            f[1] == FRAME_FC_1 &&
            f[3] == PAN_ID_LO  &&
            f[4] == PAN_ID_HI  &&
-           f[5] == s_my_addr_lo &&     /* addressed to me */
+           f[5] == s_my_addr_lo &&
            f[6] == s_my_addr_hi &&
-           f[7] == s_peer_addr_lo &&   /* from the peer */
+           f[7] == s_peer_addr_lo &&
            f[8] == s_peer_addr_hi &&
            f[9] == expected_fn;
 }
 
-/* Write a 40-bit DW3000 timestamp into a frame, little-endian, 5 bytes. */
 static void ts_to_frame(uint8_t *p, uint64_t ts)
 {
     p[0] = (uint8_t)(ts);
@@ -251,10 +243,6 @@ static uint64_t ts_from_frame(const uint8_t *p)
          | ((uint64_t)p[4] << 32);
 }
 
-/* Read DW3000's RX/TX timestamps as 64-bit values (only low 40 bits used).
- * The segment arg to dwt_readrxtimestamp is unused for DW3xxx — set to
- * DWT_COMPAT_NONE per the API header. If your driver version also takes
- * a segment arg on dwt_readtxtimestamp, add it there too. */
 static uint64_t get_tx_timestamp_u64(void)
 {
     uint8_t ts_tab[5];
@@ -273,10 +261,9 @@ static uint64_t get_rx_timestamp_u64(void)
 }
 
 /* --------------------------------------------------------------------- */
-/* Poll loops for status bits.                                            */
+/* Wait loops                                                            */
 /* --------------------------------------------------------------------- */
 
-/* Wait for TXFRS or timeout (microseconds). Returns true on TXFRS. */
 static bool wait_txfrs(int timeout_us)
 {
     int waited = 0;
@@ -291,20 +278,58 @@ static bool wait_txfrs(int timeout_us)
     return false;
 }
 
-/* Wait for any RX completion or RX error/timeout, with software timeout.
- * Returns the status word; caller checks RXFCG vs error bits. */
+/* Wait for RX completion / error / timeout. Polls every 50 µs; every
+ * 1 ms without an event, yields via vTaskDelay(1) so IDLE can run and
+ * feed the WDT. Assumes CONFIG_FREERTOS_HZ=1000 so vTaskDelay(1) = 1 ms. */
 static uint32_t wait_rx_event(int timeout_us)
 {
     int waited = 0;
     uint32_t status = 0;
+    const int poll_us  = 50;
+    const int yield_us = 1000;
+    int since_yield = 0;
+
     while (waited < timeout_us) {
         status = dwt_readsysstatuslo();
         if (status & SYS_STATUS_RX_ANY) return status;
-        esp_rom_delay_us(50);
-        waited += 50;
+        esp_rom_delay_us(poll_us);
+        waited      += poll_us;
+        since_yield += poll_us;
+        if (since_yield >= yield_us) {
+            vTaskDelay(1);
+            since_yield = 0;
+            waited += (portTICK_PERIOD_MS * 1000);
+        }
     }
-    /* Software timeout reached without hardware status — return what we have. */
     return status;
+}
+
+/* --------------------------------------------------------------------- */
+/* DS-TWR distance computation (used on the responder)                   */
+/* --------------------------------------------------------------------- */
+
+/* Compute distance from the four DS-TWR durations.
+ * All inputs are 64-bit, but the *differences* fit in 32 bits and that's
+ * how Qorvo's reference computes them. Returns distance in meters. */
+static double dstwr_distance_m(uint64_t poll_tx_ts, uint64_t resp_rx_ts,
+                               uint64_t final_tx_ts,
+                               uint64_t poll_rx_ts, uint64_t resp_tx_ts,
+                               uint64_t final_rx_ts)
+{
+    int64_t Ra = (int64_t)((uint32_t)(resp_rx_ts  - poll_tx_ts));
+    int64_t Rb = (int64_t)((uint32_t)(final_rx_ts - resp_tx_ts));
+    int64_t Da = (int64_t)((uint32_t)(final_tx_ts - resp_rx_ts));
+    int64_t Db = (int64_t)((uint32_t)(resp_tx_ts  - poll_rx_ts));
+
+    /* Numerator and denominator can be quite large; use int64 (safe up to
+     * ~9.2e18) before converting to double. */
+    int64_t num = Ra * Rb - Da * Db;
+    int64_t den = Ra + Rb + Da + Db;
+    if (den == 0) return -1.0;  /* shouldn't happen, defensive */
+
+    double tof_ticks = (double)num / (double)den;
+    double tof_s     = tof_ticks * DWT_TIME_UNITS;
+    return tof_s * SPEED_OF_LIGHT_M_PER_S;
 }
 
 /* --------------------------------------------------------------------- */
@@ -313,11 +338,16 @@ static uint32_t wait_rx_event(int timeout_us)
 
 static esp_err_t initiator_cycle(uwb_range_result_t *result)
 {
-    /* Always start clean. */
     dwt_forcetrxoff();
-    dwt_writesysstatuslo(SYS_STATUS_TXFRS_BIT_MASK | SYS_STATUS_RX_ANY);
+    /* Clear ALL TX and RX status bits — leftover from previous cycle
+     * (especially after a failed delayed-TX) can break the next cycle. */
+    dwt_writesysstatuslo(SYS_STATUS_TXFRS_BIT_MASK
+                       | SYS_STATUS_TXFRB_BIT_MASK
+                       | SYS_STATUS_TXPRS_BIT_MASK
+                       | SYS_STATUS_TXPHS_BIT_MASK
+                       | SYS_STATUS_RX_ANY);
 
-    /* --- 1. Send Poll, expect Response. --- */
+    /* === 1. Send Poll, expect Response. === */
     uint8_t poll[POLL_FRAME_LEN];
     fill_header(poll, FN_POLL,
                 ADDR_RESP_LO, ADDR_RESP_HI,
@@ -326,7 +356,6 @@ static esp_err_t initiator_cycle(uwb_range_result_t *result)
     dwt_writetxdata(POLL_FRAME_LEN, poll, 0);
     dwt_writetxfctrl(POLL_FRAME_LEN + FCS_LEN, 0, 1);
 
-    /* Arm RX-after-TX so we catch the Response without a software gap. */
     dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
     dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
 
@@ -335,27 +364,25 @@ static esp_err_t initiator_cycle(uwb_range_result_t *result)
         return ESP_FAIL;
     }
 
-    /* --- 2. Wait for Response RX. --- */
-    uint32_t status = wait_rx_event(5000);  /* 5 ms covers UWB timeout */
+    /* === 2. Wait for Response RX. ===
+     * Software timeout exceeds hw RESP_RX_TIMEOUT_UUS + POLL_TX_TO_RESP_RX_DLY_UUS
+     * plus margin. */
+    uint32_t status = wait_rx_event(15000);
     if (!(status & SYS_STATUS_RXFCG_BIT_MASK)) {
         if (status & (SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)) {
             dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
-            static int err_log = 0;
-            if (err_log++ % 50 == 0) {
-                ESP_LOGW(TAG, "Resp RX miss (status=0x%08lX)", (unsigned long)status);
-            }
-        } else {
-            static int to_log = 0;
-            if (to_log++ % 50 == 0) {
-                ESP_LOGW(TAG, "Resp RX sw-timeout (status=0x%08lX)", (unsigned long)status);
-            }
-            dwt_forcetrxoff();
         }
-        return ESP_OK;  /* not a driver failure — just no answer this cycle */
+        static int miss_log = 0;
+        if (miss_log < 5 || miss_log % 50 == 0) {
+            ESP_LOGW(TAG, "Resp RX miss #%d (status=0x%08lX)", miss_log, (unsigned long)status);
+        }
+        miss_log++;
+        dwt_forcetrxoff();
+        return ESP_OK;
     }
     dwt_writesysstatuslo(SYS_STATUS_RXFCG_BIT_MASK);
 
-    /* --- 3. Validate Response frame. --- */
+    /* === 3. Validate Response and extract timestamps. === */
     uint8_t  ranging_bit = 0;
     uint16_t flen = dwt_getframelength(&ranging_bit);
     if (flen != RESP_FRAME_LEN + FCS_LEN || flen > RX_BUF_LEN) {
@@ -368,45 +395,124 @@ static esp_err_t initiator_cycle(uwb_range_result_t *result)
         return ESP_OK;
     }
 
-    /* --- 4. Compute ToF and distance. --- */
     uint64_t poll_tx_ts = get_tx_timestamp_u64();
     uint64_t resp_rx_ts = get_rx_timestamp_u64();
     uint64_t poll_rx_ts = ts_from_frame(&rx_buf[RESP_POLL_RX_TS_IDX]);
     uint64_t resp_tx_ts = ts_from_frame(&rx_buf[RESP_RESP_TX_TS_IDX]);
 
-    /* All arithmetic in 32-bit subtraction (deltas fit in <2^32), with the
-     * top bits naturally truncated. This is the standard SS-TWR pattern. */
-    uint32_t rtd_init = (uint32_t)(resp_rx_ts - poll_tx_ts);
-    uint32_t rtd_resp = (uint32_t)(resp_tx_ts - poll_rx_ts);
-
-    double tof = ((double)rtd_init - (double)rtd_resp) / 2.0 * DWT_TIME_UNITS;
-    double distance_m = tof * SPEED_OF_LIGHT_M_PER_S - g_uwb_distance_offset_m;
-
-    /* Periodic raw-timestamp diagnostic. Print every 30 cycles so we
-     * can spot patterns (bimodal distances, clock drift, etc). */
-    static int diag_count = 0;
-    if (diag_count++ % 30 == 0) {
-        ESP_LOGI(TAG, "TS: poll_tx=%llu poll_rx=%llu resp_tx=%llu resp_rx=%llu",
-                 (unsigned long long)poll_tx_ts, (unsigned long long)poll_rx_ts,
-                 (unsigned long long)resp_tx_ts, (unsigned long long)resp_rx_ts);
-        ESP_LOGI(TAG, "    rtd_init=%lu rtd_resp=%lu diff=%ld d=%.3f m",
-                 (unsigned long)rtd_init, (unsigned long)rtd_resp,
-                 (long)((int32_t)rtd_init - (int32_t)rtd_resp), distance_m);
+    /* Periodic diagnostic — much less frequent now that protocol is working. */
+    static int resp_dbg = 0;
+    if (resp_dbg++ % 100 == 0) {
+        ESP_LOGI(TAG, "Resp ts: poll_rx=%llu resp_tx=%llu",
+                 (unsigned long long)poll_rx_ts, (unsigned long long)resp_tx_ts);
     }
 
-    /* Sanity-check before reporting. ToF math can produce garbage if the
-     * peer is out of range or a frame got corrupted. */
+    /* === 4. Schedule Final TX and embed all three local timestamps. ===
+     *
+     * Same ordering as the responder: set RX-after-TX config first (it
+     * applies post-TX), then build and write the frame, then the time-
+     * critical setdelayedtrxtime → starttx pair. */
+
+    dwt_setrxaftertxdelay(FINAL_TX_TO_REPORT_RX_DLY_UUS);
+    dwt_setrxtimeout(REPORT_RX_TIMEOUT_UUS);
+
+    uint32_t final_tx_time = (uint32_t)((resp_rx_ts +
+                                         (RESP_RX_TO_FINAL_TX_DLY_UUS * UUS_TO_DWT_TIME))
+                                        >> 8);
+    uint64_t final_tx_ts = (((uint64_t)(final_tx_time & 0xFFFFFFFEUL)) << 8) + TX_ANT_DLY;
+
+    uint8_t final_frame[FINAL_FRAME_LEN];
+    fill_header(final_frame, FN_FINAL,
+                ADDR_RESP_LO, ADDR_RESP_HI,
+                s_my_addr_lo, s_my_addr_hi);
+    ts_to_frame(&final_frame[FINAL_POLL_TX_TS_IDX],  poll_tx_ts);
+    ts_to_frame(&final_frame[FINAL_RESP_RX_TS_IDX],  resp_rx_ts);
+    ts_to_frame(&final_frame[FINAL_FINAL_TX_TS_IDX], final_tx_ts);
+
+    dwt_writetxdata(FINAL_FRAME_LEN, final_frame, 0);
+    dwt_writetxfctrl(FINAL_FRAME_LEN + FCS_LEN, 0, 1);
+
+    dwt_setdelayedtrxtime(final_tx_time);
+
+    int8_t txret = dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
+    if (txret != DWT_SUCCESS) {
+        /* Same workaround as on responder: HPDWARN trips spuriously, but
+         * TX often fires anyway. Poll for TXFRS to determine actual fate. */
+        bool tx_fired = false;
+        int waited = 0;
+        while (waited < 8000) {
+            if (dwt_readsysstatuslo() & SYS_STATUS_TXFRS_BIT_MASK) {
+                tx_fired = true;
+                break;
+            }
+            esp_rom_delay_us(50);
+            waited += 50;
+        }
+        static int late_log = 0;
+        if (late_log < 5 || late_log % 100 == 0) {
+            ESP_LOGW(TAG, "Final TX driver-error #%d (fired=%d)",
+                     late_log, tx_fired ? 1 : 0);
+        }
+        late_log++;
+        if (!tx_fired) {
+            dwt_forcetrxoff();
+            return ESP_OK;
+        }
+        dwt_writesysstatuslo(SYS_STATUS_TXFRS_BIT_MASK);
+    }
+
+    /* === 5. Wait for Report RX. === */
+    status = wait_rx_event(15000);
+    if (!(status & SYS_STATUS_RXFCG_BIT_MASK)) {
+        if (status & (SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)) {
+            dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+        }
+        static int rep_miss = 0;
+        if (rep_miss++ % 20 == 0) {
+            ESP_LOGW(TAG, "Report RX miss (status=0x%08lX)", (unsigned long)status);
+        }
+        dwt_forcetrxoff();
+        return ESP_OK;
+    }
+    dwt_writesysstatuslo(SYS_STATUS_RXFCG_BIT_MASK);
+
+    /* === 6. Validate Report and extract distance. === */
+    flen = dwt_getframelength(&ranging_bit);
+    if (flen != REPORT_FRAME_LEN + FCS_LEN || flen > RX_BUF_LEN) {
+        static int rep_len_log = 0;
+        if (rep_len_log++ < 5) {
+            ESP_LOGW(TAG, "Report wrong length %u (expected %d)",
+                     flen, REPORT_FRAME_LEN + FCS_LEN);
+        }
+        return ESP_OK;
+    }
+    dwt_readrxdata(rx_buf, REPORT_FRAME_LEN, 0);
+
+    if (!header_ok(rx_buf, FN_REPORT)) {
+        static int rep_hdr_log = 0;
+        if (rep_hdr_log++ < 5) {
+            ESP_LOGW(TAG, "Report header mismatch: fn=0x%02X expected 0x%02X",
+                     rx_buf[9], FN_REPORT);
+        }
+        return ESP_OK;
+    }
+
+    int32_t distance_mm = (int32_t)((uint32_t)rx_buf[REPORT_DIST_IDX + 0]
+                                  | ((uint32_t)rx_buf[REPORT_DIST_IDX + 1] << 8)
+                                  | ((uint32_t)rx_buf[REPORT_DIST_IDX + 2] << 16)
+                                  | ((uint32_t)rx_buf[REPORT_DIST_IDX + 3] << 24));
+    double distance_m = distance_mm / 1000.0;
+
     if (distance_m < -1.0 || distance_m > 500.0) {
         static int sane_log = 0;
         if (sane_log++ % 20 == 0) {
-            ESP_LOGW(TAG, "Insane distance %.2f m (rtd_init=%lu rtd_resp=%lu)",
-                     distance_m, (unsigned long)rtd_init, (unsigned long)rtd_resp);
+            ESP_LOGW(TAG, "Insane reported distance %.3f m", distance_m);
         }
         return ESP_OK;
     }
 
     if (result) {
-        result->distance_m   = (float)distance_m;
+        result->distance_m   = (float)(distance_m - g_uwb_distance_offset_m);
         result->timestamp_us = esp_timer_get_time();
         result->valid        = true;
     }
@@ -415,31 +521,7 @@ static esp_err_t initiator_cycle(uwb_range_result_t *result)
     static int success_count = 0;
     success_count++;
     if (success_count % 20 == 1) {
-        ESP_LOGI(TAG, "Range OK #%d d=%.3f m", success_count, distance_m);
-    }
-
-    /* --- 5. Send Final with the distance, so responder knows it too. --- */
-    uint8_t final[FINAL_FRAME_LEN];
-    fill_header(final, FN_FINAL,
-                ADDR_RESP_LO, ADDR_RESP_HI,
-                s_my_addr_lo, s_my_addr_hi);
-    int32_t distance_mm = (int32_t)(distance_m * 1000.0);
-    final[FINAL_DIST_IDX + 0] = (uint8_t)(distance_mm);
-    final[FINAL_DIST_IDX + 1] = (uint8_t)(distance_mm >> 8);
-    final[FINAL_DIST_IDX + 2] = (uint8_t)(distance_mm >> 16);
-    final[FINAL_DIST_IDX + 3] = (uint8_t)(distance_mm >> 24);
-
-    dwt_writetxdata(FINAL_FRAME_LEN, final, 0);
-    dwt_writetxfctrl(FINAL_FRAME_LEN + FCS_LEN, 0, 1);
-
-    /* No response expected for Final — fire and forget. */
-    dwt_writesysstatuslo(SYS_STATUS_TXFRS_BIT_MASK);
-    if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS) {
-        ESP_LOGW(TAG, "Final TX start failed");
-        return ESP_OK;
-    }
-    if (!wait_txfrs(3000)) {
-        ESP_LOGW(TAG, "Final TXFRS timeout");
+        ESP_LOGI(TAG, "Range OK #%d d=%.3f m", success_count, result->distance_m);
     }
 
     s_seq++;
@@ -453,80 +535,73 @@ static esp_err_t initiator_cycle(uwb_range_result_t *result)
 static esp_err_t responder_cycle(uwb_range_result_t *result)
 {
     dwt_forcetrxoff();
-    dwt_writesysstatuslo(SYS_STATUS_TXFRS_BIT_MASK | SYS_STATUS_RX_ANY);
+    dwt_writesysstatuslo(SYS_STATUS_TXFRS_BIT_MASK
+                       | SYS_STATUS_TXFRB_BIT_MASK
+                       | SYS_STATUS_TXPRS_BIT_MASK
+                       | SYS_STATUS_TXPHS_BIT_MASK
+                       | SYS_STATUS_RX_ANY);
 
-    /* --- 1. Listen for Poll. Time-bounded so we can return to the task
-     *        loop and remain responsive to shutdown / role-change. --- */
+    /* === 1. Listen for Poll. === */
     dwt_setrxaftertxdelay(0);
-    dwt_setrxtimeout(0);  /* no HW timeout; we'll use a SW one */
+    dwt_setrxtimeout(0);
     if (dwt_rxenable(DWT_START_RX_IMMEDIATE) != DWT_SUCCESS) {
         ESP_LOGE(TAG, "rxenable failed");
         return ESP_FAIL;
     }
 
-    /* Wait up to ~150 ms for a Poll. At 10 Hz partner cadence we should
-     * see one every 100 ms. */
     uint32_t status = wait_rx_event(150000);
     if (!(status & SYS_STATUS_RXFCG_BIT_MASK)) {
         if (status & (SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)) {
             dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
         }
+        static int poll_miss = 0;
+        if (poll_miss < 5 || poll_miss % 50 == 0) {
+            ESP_LOGW(TAG, "Poll RX miss #%d (status=0x%08lX)", poll_miss, (unsigned long)status);
+        }
+        poll_miss++;
         dwt_forcetrxoff();
-        return ESP_OK;  /* no poll this window, try again */
+        return ESP_OK;
     }
     dwt_writesysstatuslo(SYS_STATUS_RXFCG_BIT_MASK);
 
-    /* --- 2. Validate Poll. --- */
+    /* === 2. Validate Poll. === */
     uint8_t  ranging_bit = 0;
     uint16_t flen = dwt_getframelength(&ranging_bit);
-    if (flen != POLL_FRAME_LEN + FCS_LEN || flen > RX_BUF_LEN) {
-        return ESP_OK;
-    }
+    if (flen != POLL_FRAME_LEN + FCS_LEN || flen > RX_BUF_LEN) return ESP_OK;
     dwt_readrxdata(rx_buf, POLL_FRAME_LEN, 0);
-    if (!header_ok(rx_buf, FN_POLL)) {
-        return ESP_OK;
-    }
+    if (!header_ok(rx_buf, FN_POLL)) return ESP_OK;
     uint8_t peer_seq = rx_buf[2];
 
-    /* Periodic confirmation that Poll RX is working. */
     static int poll_rx_count = 0;
     poll_rx_count++;
     if (poll_rx_count % 20 == 1) {
         ESP_LOGI(TAG, "Poll RX #%d (seq=%u)", poll_rx_count, peer_seq);
     }
 
-    /* --- 3. Schedule Response TX at poll_rx_ts + delay. ---
+    /* === 3. Schedule Response TX (with embedded poll_rx_ts, resp_tx_ts). ===
      *
-     * (a) dwt_setdelayedtrxtime takes the *top 32 bits* of a 40-bit
-     *     timestamp. The hardware then schedules TX at that value
-     *     left-shifted by 8 — but it *also* zeroes the bottom bit
-     *     of the value we passed in (so the bottom 9 bits of the
-     *     full 40-bit timestamp are guaranteed zero, not just the
-     *     bottom 8). This is documented in the Qorvo SS-TWR examples
-     *     but not in the API header.
-     *
-     * (b) Because of (a), the *embedded* resp_tx_ts that we put in
-     *     the frame must mask bit 0 of resp_tx_time *before* the
-     *     left-shift. If we don't, on cycles where bit 0 was 1 the
-     *     embedded value is 256 ticks higher than what actually went
-     *     on the air. After halving in the initiator's ToF math,
-     *     that's a 128-tick (~0.6 m) bimodal error in computed
-     *     distance — every other cycle wrong by half a meter.
-     *
-     * (c) The embedded value includes TX_ANT_DLY because the air-time
-     *     timestamp the initiator measures is offset by that delay.
-     */
+     * Order of operations matters here: setdelayedtrxtime → starttx must
+     * happen with minimal SPI in between, because the chip evaluates the
+     * scheduled time against its current system time at starttx. Set up
+     * RX-after-TX config FIRST (it only takes effect after TX completes,
+     * so timing doesn't matter), then build the frame and write it, then
+     * do the time-critical setdelayedtrxtime → starttx sequence. */
+
+    /* Set up RX-after-TX first — these don't affect TX scheduling timing. */
+    dwt_setrxaftertxdelay(RESP_TX_TO_FINAL_RX_DLY_UUS);
+    dwt_setrxtimeout(FINAL_RX_TIMEOUT_UUS);
+
+    int64_t t_before_sched_us = esp_timer_get_time();
     uint64_t poll_rx_ts = get_rx_timestamp_u64();
     uint32_t resp_tx_time = (uint32_t)((poll_rx_ts +
                                         (POLL_RX_TO_RESP_TX_DLY_UUS * UUS_TO_DWT_TIME))
                                        >> 8);
-    dwt_setdelayedtrxtime(resp_tx_time);
-
     uint64_t resp_tx_ts = (((uint64_t)(resp_tx_time & 0xFFFFFFFEUL)) << 8) + TX_ANT_DLY;
 
-    /* Build Response frame. */
+    /* Build the Response frame BEFORE we set the delayed TX time, so the
+     * time-critical window between setdelayedtrxtime and starttx is tight. */
     uint8_t resp[RESP_FRAME_LEN];
-    s_seq = peer_seq;  /* mirror the initiator's seq for the Response */
+    s_seq = peer_seq;
     fill_header(resp, FN_RESPONSE,
                 ADDR_INIT_LO, ADDR_INIT_HI,
                 s_my_addr_lo, s_my_addr_hi);
@@ -536,58 +611,147 @@ static esp_err_t responder_cycle(uwb_range_result_t *result)
     dwt_writetxdata(RESP_FRAME_LEN, resp, 0);
     dwt_writetxfctrl(RESP_FRAME_LEN + FCS_LEN, 0, 1);
 
-    /* Arm RX-after-TX so we catch the Final without a software gap. */
-    dwt_setrxaftertxdelay(RESP_TX_TO_FINAL_RX_DLY_UUS);
-    dwt_setrxtimeout(FINAL_RX_TIMEOUT_UUS);
+    /* Now the tight window: setdelayedtrxtime → starttx. */
+    dwt_setdelayedtrxtime(resp_tx_time);
 
     int8_t txret = dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
-    if (txret != DWT_SUCCESS) {
-        /* Most common cause: scheduled TX time has already passed.
-         * That means the SPI write took longer than expected — bump
-         * POLL_RX_TO_RESP_TX_DLY_UUS. */
-        static int late_log = 0;
-        if (late_log++ % 20 == 0) {
-            ESP_LOGW(TAG, "Resp TX delayed-start failed (late?); raise POLL_RX_TO_RESP_TX_DLY_UUS");
-        }
-        dwt_forcetrxoff();
-        return ESP_OK;
+    int64_t t_after_sched_us = esp_timer_get_time();
+    int64_t sched_elapsed_us = t_after_sched_us - t_before_sched_us;
+
+    static int sched_diag = 0;
+    if (sched_diag++ < 5) {
+        ESP_LOGI(TAG, "Resp TX sched host time: %lld us (delay budget %u uus)",
+                 (long long)sched_elapsed_us,
+                 (unsigned)POLL_RX_TO_RESP_TX_DLY_UUS);
     }
 
-    /* --- 4. Wait for Final RX. --- */
-    status = wait_rx_event(8000);
+    if (txret != DWT_SUCCESS) {
+        /* On this chip/driver, HPDWARN trips spuriously even with ample
+         * scheduling margin. The driver attempts to cancel via CMD_TXRXOFF
+         * but the cancel races with the TX preamble start and frequently
+         * loses — TX fires anyway. Poll for TXFRS to detect actual fire.
+         * If TXFRS arrives within a few ms, the TX really did happen with
+         * the embedded timestamps we set; the initiator will receive it
+         * correctly and the cycle continues. */
+        bool tx_fired = false;
+        int waited = 0;
+        while (waited < 8000) {  /* 8 ms covers worst-case delay + air time */
+            if (dwt_readsysstatuslo() & SYS_STATUS_TXFRS_BIT_MASK) {
+                tx_fired = true;
+                break;
+            }
+            esp_rom_delay_us(50);
+            waited += 50;
+        }
+        static int late_log = 0;
+        if (late_log < 5 || late_log % 100 == 0) {
+            ESP_LOGW(TAG, "Resp TX driver-error #%d (host %lld us, fired=%d)",
+                     late_log, (long long)sched_elapsed_us, tx_fired ? 1 : 0);
+        }
+        late_log++;
+        if (!tx_fired) {
+            /* Genuine cancel — TX did not happen. Abort cycle. */
+            dwt_forcetrxoff();
+            return ESP_OK;
+        }
+        /* TX did fire. Clear the TXFRS bit and continue. */
+        dwt_writesysstatuslo(SYS_STATUS_TXFRS_BIT_MASK);
+    }
+
+    /* === 4. Wait for Final RX. ===
+     * Software timeout exceeds hardware FINAL_RX_TIMEOUT_UUS plus detection
+     * jitter. */
+    status = wait_rx_event(20000);
     if (!(status & SYS_STATUS_RXFCG_BIT_MASK)) {
         if (status & (SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)) {
             dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
         }
         static int final_miss = 0;
-        if (final_miss++ % 20 == 0) {
-            ESP_LOGW(TAG, "Final RX miss (status=0x%08lX, count=%d)",
-                     (unsigned long)status, final_miss);
+        if (final_miss < 5 || final_miss % 20 == 0) {
+            ESP_LOGW(TAG, "Final RX miss #%d (status=0x%08lX)",
+                     final_miss, (unsigned long)status);
         }
+        final_miss++;
         dwt_forcetrxoff();
-        return ESP_OK;  /* Response sent but distance lost this cycle */
+        return ESP_OK;
     }
     dwt_writesysstatuslo(SYS_STATUS_RXFCG_BIT_MASK);
 
-    /* --- 5. Validate Final and extract distance. --- */
+    /* === 5. Validate Final and read embedded timestamps. === */
     flen = dwt_getframelength(&ranging_bit);
-    if (flen != FINAL_FRAME_LEN + FCS_LEN || flen > RX_BUF_LEN) {
-        return ESP_OK;
-    }
+    if (flen != FINAL_FRAME_LEN + FCS_LEN || flen > RX_BUF_LEN) return ESP_OK;
     dwt_readrxdata(rx_buf, FINAL_FRAME_LEN, 0);
-    if (!header_ok(rx_buf, FN_FINAL)) {
+    if (!header_ok(rx_buf, FN_FINAL)) return ESP_OK;
+
+    uint64_t poll_tx_ts  = ts_from_frame(&rx_buf[FINAL_POLL_TX_TS_IDX]);
+    uint64_t resp_rx_ts  = ts_from_frame(&rx_buf[FINAL_RESP_RX_TS_IDX]);
+    uint64_t final_tx_ts = ts_from_frame(&rx_buf[FINAL_FINAL_TX_TS_IDX]);
+    uint64_t final_rx_ts = get_rx_timestamp_u64();
+
+    /* === 6. Compute DS-TWR distance. === */
+    double distance_m = dstwr_distance_m(poll_tx_ts, resp_rx_ts, final_tx_ts,
+                                         poll_rx_ts, resp_tx_ts, final_rx_ts);
+
+    /* Periodic timestamp diagnostic, like SS-TWR. */
+    static int diag_count = 0;
+    if (diag_count++ % 30 == 0) {
+        uint32_t Ra = (uint32_t)(resp_rx_ts  - poll_tx_ts);
+        uint32_t Rb = (uint32_t)(final_rx_ts - resp_tx_ts);
+        uint32_t Da = (uint32_t)(final_tx_ts - resp_rx_ts);
+        uint32_t Db = (uint32_t)(resp_tx_ts  - poll_rx_ts);
+        ESP_LOGI(TAG, "TS: pT=%llu pR=%llu rT=%llu rR=%llu fT=%llu fR=%llu",
+                 (unsigned long long)poll_tx_ts,
+                 (unsigned long long)poll_rx_ts,
+                 (unsigned long long)resp_tx_ts,
+                 (unsigned long long)resp_rx_ts,
+                 (unsigned long long)final_tx_ts,
+                 (unsigned long long)final_rx_ts);
+        ESP_LOGI(TAG, "    Ra=%lu Rb=%lu Da=%lu Db=%lu d=%.3f m",
+                 (unsigned long)Ra, (unsigned long)Rb,
+                 (unsigned long)Da, (unsigned long)Db, distance_m);
+    }
+
+    if (distance_m < -1.0 || distance_m > 500.0) {
+        static int sane_log = 0;
+        if (sane_log++ % 20 == 0) {
+            ESP_LOGW(TAG, "Insane DS-TWR distance %.3f m", distance_m);
+        }
+        dwt_forcetrxoff();
         return ESP_OK;
     }
-    int32_t distance_mm = (int32_t)((uint32_t)rx_buf[FINAL_DIST_IDX + 0]
-                                  | ((uint32_t)rx_buf[FINAL_DIST_IDX + 1] << 8)
-                                  | ((uint32_t)rx_buf[FINAL_DIST_IDX + 2] << 16)
-                                  | ((uint32_t)rx_buf[FINAL_DIST_IDX + 3] << 24));
 
+    /* Apply offset and store locally. */
+    double distance_m_calibrated = distance_m - g_uwb_distance_offset_m;
     if (result) {
-        result->distance_m   = distance_mm / 1000.0f;
+        result->distance_m   = (float)distance_m_calibrated;
         result->timestamp_us = esp_timer_get_time();
         result->valid        = true;
     }
+
+    /* === 7. Send Report back so the initiator knows the distance too. === */
+    int32_t distance_mm = (int32_t)(distance_m_calibrated * 1000.0);
+    uint8_t report[REPORT_FRAME_LEN];
+    fill_header(report, FN_REPORT,
+                ADDR_INIT_LO, ADDR_INIT_HI,
+                s_my_addr_lo, s_my_addr_hi);
+    report[REPORT_DIST_IDX + 0] = (uint8_t)(distance_mm);
+    report[REPORT_DIST_IDX + 1] = (uint8_t)(distance_mm >> 8);
+    report[REPORT_DIST_IDX + 2] = (uint8_t)(distance_mm >> 16);
+    report[REPORT_DIST_IDX + 3] = (uint8_t)(distance_mm >> 24);
+
+    dwt_writetxdata(REPORT_FRAME_LEN, report, 0);
+    dwt_writetxfctrl(REPORT_FRAME_LEN + FCS_LEN, 0, 1);
+
+    /* Report is fire-and-forget; no RX after. */
+    dwt_writesysstatuslo(SYS_STATUS_TXFRS_BIT_MASK);
+    if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS) {
+        ESP_LOGW(TAG, "Report TX start failed");
+        return ESP_OK;
+    }
+    if (!wait_txfrs(3000)) {
+        ESP_LOGW(TAG, "Report TXFRS timeout");
+    }
+
     return ESP_OK;
 }
 
@@ -605,7 +769,7 @@ esp_err_t uwb_init(uwb_role_t role, int mosi, int miso, int sclk, int cs, int rs
         s_my_addr_lo   = ADDR_RESP_LO; s_my_addr_hi   = ADDR_RESP_HI;
         s_peer_addr_lo = ADDR_INIT_LO; s_peer_addr_hi = ADDR_INIT_HI;
     }
-    ESP_LOGI(TAG, "Init UWB role=%s addr=%c%c peer=%c%c",
+    ESP_LOGI(TAG, "Init UWB role=%s addr=%c%c peer=%c%c (DS-TWR)",
              role == UWB_ROLE_INITIATOR ? "initiator" : "responder",
              s_my_addr_lo, s_my_addr_hi,
              s_peer_addr_lo, s_peer_addr_hi);
@@ -630,7 +794,7 @@ esp_err_t uwb_init(uwb_role_t role, int mosi, int miso, int sclk, int cs, int rs
     dwt_setrxantennadelay(RX_ANT_DLY);
     dwt_setlnapamode(DWT_LNA_ENABLE | DWT_PA_ENABLE);
 
-    ESP_LOGI(TAG, "UWB ready (chan 5, PLEN 64, 6.8 Mbps)");
+    ESP_LOGI(TAG, "UWB ready (chan 5, PLEN 64, 6.8 Mbps, DS-TWR)");
     return ESP_OK;
 }
 
