@@ -141,9 +141,15 @@ float g_uwb_distance_offset_m = 0.0f;
 #define FINAL_POLL_TX_TS_IDX  10
 #define FINAL_RESP_RX_TS_IDX  15
 #define FINAL_FINAL_TX_TS_IDX 20
-/* Report: header + distance_mm(4) */
-#define REPORT_FRAME_LEN 14
-#define REPORT_DIST_IDX  10
+/* Report: header + distance_mm(4) + imu_sample (sizeof(lsm6_sample_t)).
+ *
+ * Floats serialize via memcpy — both boards are little-endian RISC-V
+ * with the same IEEE-754 representation, so byte-equality round-trips.
+ * If you ever support a mixed-architecture peer, switch to explicit
+ * float-to-int16 packing or a wire-level fixed-point encoding. */
+#define REPORT_FRAME_LEN   (14 + (int)sizeof(lsm6_sample_t))
+#define REPORT_DIST_IDX    10
+#define REPORT_IMU_IDX     14
 
 /* --------------------------------------------------------------------- */
 /* State                                                                  */
@@ -156,7 +162,17 @@ static uint8_t    s_my_addr_hi;
 static uint8_t    s_peer_addr_lo;
 static uint8_t    s_peer_addr_hi;
 
-#define RX_BUF_LEN 32
+/* Local IMU snapshot, published by uwb_publish_local_imu and read by the
+ * responder when assembling the Report frame. Protected by spinlock so
+ * the imu timer callback (publisher) and uwb task (consumer) can run on
+ * different cores without tearing. */
+static portMUX_TYPE  s_imu_lock = portMUX_INITIALIZER_UNLOCKED;
+static lsm6_sample_t s_local_imu;
+static bool          s_local_imu_valid = false;
+
+/* Report frame size is 14 + sizeof(lsm6_sample_t) = 54. Plus FCS = 56.
+ * Bump RX buffer to comfortably hold it. */
+#define RX_BUF_LEN 64
 static uint8_t rx_buf[RX_BUF_LEN];
 
 /* --------------------------------------------------------------------- */
@@ -515,6 +531,21 @@ static esp_err_t initiator_cycle(uwb_range_result_t *result)
         result->distance_m   = (float)(distance_m - g_uwb_distance_offset_m);
         result->timestamp_us = esp_timer_get_time();
         result->valid        = true;
+
+        /* Pull the responder's IMU sample out of the Report. The bytes
+         * are all 0xFF if the responder hadn't published a sample yet —
+         * detect that and mark invalid. */
+        bool all_ff = true;
+        for (size_t i = 0; i < sizeof(lsm6_sample_t); i++) {
+            if (rx_buf[REPORT_IMU_IDX + i] != 0xFF) { all_ff = false; break; }
+        }
+        if (!all_ff) {
+            memcpy(&result->peer_imu, &rx_buf[REPORT_IMU_IDX],
+                   sizeof(result->peer_imu));
+            result->peer_imu_valid = true;
+        } else {
+            result->peer_imu_valid = false;
+        }
     }
 
     /* Periodic confirmation. */
@@ -739,6 +770,23 @@ static esp_err_t responder_cycle(uwb_range_result_t *result)
     report[REPORT_DIST_IDX + 2] = (uint8_t)(distance_mm >> 16);
     report[REPORT_DIST_IDX + 3] = (uint8_t)(distance_mm >> 24);
 
+    /* Snapshot the latest local IMU sample (if any) into the Report. */
+    lsm6_sample_t imu_snap;
+    bool imu_snap_valid;
+    portENTER_CRITICAL(&s_imu_lock);
+    imu_snap       = s_local_imu;
+    imu_snap_valid = s_local_imu_valid;
+    portEXIT_CRITICAL(&s_imu_lock);
+    if (imu_snap_valid) {
+        memcpy(&report[REPORT_IMU_IDX], &imu_snap, sizeof(imu_snap));
+    } else {
+        /* Zero the IMU bytes so the initiator can detect "no sample yet"
+         * via a known sentinel. We use NaN in the first float as the
+         * "invalid" signal (zero would be ambiguous with a real reading
+         * of motionless sensor at rest). */
+        memset(&report[REPORT_IMU_IDX], 0xFF, sizeof(imu_snap));
+    }
+
     dwt_writetxdata(REPORT_FRAME_LEN, report, 0);
     dwt_writetxfctrl(REPORT_FRAME_LEN + FCS_LEN, 0, 1);
 
@@ -801,10 +849,24 @@ esp_err_t uwb_init(uwb_role_t role, int mosi, int miso, int sclk, int cs, int rs
 esp_err_t uwb_perform_ranging(uwb_range_result_t *result)
 {
     if (result) {
-        result->valid        = false;
-        result->distance_m   = 0.0f;
-        result->timestamp_us = 0;
+        result->valid          = false;
+        result->distance_m     = 0.0f;
+        result->timestamp_us   = 0;
+        result->peer_imu_valid = false;
+        /* Don't bother zeroing result->peer_imu — meaningless when invalid. */
     }
     if (s_role == UWB_ROLE_INITIATOR) return initiator_cycle(result);
     return responder_cycle(result);
+}
+
+void uwb_publish_local_imu(const lsm6_sample_t *sample)
+{
+    /* Only the responder embeds this into Report frames; initiator-side
+     * calls are accepted but unused. Storing on both sides anyway is
+     * harmless and makes the API role-agnostic. */
+    if (!sample) return;
+    portENTER_CRITICAL(&s_imu_lock);
+    s_local_imu       = *sample;
+    s_local_imu_valid = true;
+    portEXIT_CRITICAL(&s_imu_lock);
 }

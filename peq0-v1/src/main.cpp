@@ -27,7 +27,7 @@ static const char *TAG = "main";
 
 // Set this per-board: one as INITIATOR, the other as RESPONDER.
 // Flash the same firmware to both and just change this define.
-#define MY_UWB_ROLE  UWB_ROLE_INITIATOR// UWB_ROLE_RESPONDER or UWB_ROLE_INITIATOR
+#define MY_UWB_ROLE  UWB_ROLE_INITIATOR  // UWB_ROLE_RESPONDER or UWB_ROLE_INITIATOR
 
 // Sampling and reporting rates
 #define IMU_SAMPLE_HZ     200
@@ -41,11 +41,16 @@ static const char *TAG = "main";
 // ---------------------------------------------------------------------------
 // Shared state — UWB task writes, IMU task reads.
 //
-// Protected by a portMUX_TYPE spinlock. The struct is small (~16 bytes) and
-// contention is essentially zero (UWB writes at 10 Hz, IMU reads at 10 Hz),
-// so a spinlock is faster and simpler than a mutex and never blocks.
+// Protected by a portMUX_TYPE spinlock. The struct is small and contention
+// is essentially zero (UWB writes at 10 Hz, IMU reads at 10 Hz), so a
+// spinlock is faster and simpler than a mutex and never blocks.
+//
+// The struct now also carries the peer's IMU sample (piggybacked on the
+// Report frame from the responder). Initiator-side: peer_imu_valid will
+// be set after the first successful range cycle that includes IMU bytes.
+// Responder-side: peer_imu_valid stays false (we are the IMU source).
 // ---------------------------------------------------------------------------
-static uwb_range_result_t s_last_range = { 0.0f, 0, false };
+static uwb_range_result_t s_last_range = { /* zero-init all fields */ };
 static portMUX_TYPE       s_range_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static inline void range_publish(const uwb_range_result_t *r) {
@@ -87,6 +92,11 @@ static void imu_timer_cb(void *arg)
     // not an ISR — I2C transactions are safe here.
     lsm6_sample_t s;
     if (lsm6_read_sample(&s) != ESP_OK) return;
+
+    // Publish to the UWB module so the responder can embed the freshest
+    // sample in its next Report frame. On the initiator this is harmless
+    // (the function checks role internally).
+    uwb_publish_local_imu(&s);
 
     // Non-blocking send. If the queue is full, drop the oldest sample to
     // keep newest data flowing rather than backing up the timer.
@@ -199,6 +209,24 @@ static void imu_print_task(void *arg)
                p.temp_c,
                window_peak_g, all_time_peak_g,
                range_str);
+
+        // Peer IMU summary every ~1 s when present, to avoid cluttering
+        // the main per-print line. Computed from the most recent ranging
+        // cycle's piggybacked IMU sample. Skipped entirely on the
+        // responder (no peer IMU to display).
+        static int peer_print_counter = 0;
+        if (++peer_print_counter >= IMU_PRINT_HZ) {
+            peer_print_counter = 0;
+            if (r.peer_imu_valid) {
+                const lsm6_sample_t &q = r.peer_imu;
+                float peer_high_g = sqrtf(q.hx_g*q.hx_g + q.hy_g*q.hy_g + q.hz_g*q.hz_g);
+                printf("# peer IMU: ax=%+.3f ay=%+.3f az=%+.3f  "
+                       "h|=%.2fg  gz=%+.2f dps  T=%.1f\n",
+                       q.ax_g, q.ay_g, q.az_g,
+                       peer_high_g,
+                       q.gz_dps, q.temp_c);
+            }
+        }
 
         // Reset window
         window_peak_g     = 0.0f;
