@@ -121,8 +121,13 @@ float g_uwb_distance_offset_m = 0.0f;
 
 #define ADDR_INIT_LO    'V'
 #define ADDR_INIT_HI    'E'
-#define ADDR_RESP_LO    'W'
-#define ADDR_RESP_HI    'A'
+
+/* All responders share the prefix 'W'; the suffix ('A'..'I') is set at
+ * uwb_init time via responder_addr_suffix. The initiator picks a specific
+ * responder per cycle via the peer_addr_suffix argument to
+ * uwb_perform_ranging. */
+#define ADDR_RESP_PREFIX 'W'
+#define DEFAULT_RESP_SUFFIX 'A'
 
 #define FN_POLL         0x21
 #define FN_RESPONSE     0x10
@@ -366,7 +371,7 @@ static esp_err_t initiator_cycle(uwb_range_result_t *result)
     /* === 1. Send Poll, expect Response. === */
     uint8_t poll[POLL_FRAME_LEN];
     fill_header(poll, FN_POLL,
-                ADDR_RESP_LO, ADDR_RESP_HI,
+                s_peer_addr_lo, s_peer_addr_hi,
                 s_my_addr_lo, s_my_addr_hi);
 
     dwt_writetxdata(POLL_FRAME_LEN, poll, 0);
@@ -439,7 +444,7 @@ static esp_err_t initiator_cycle(uwb_range_result_t *result)
 
     uint8_t final_frame[FINAL_FRAME_LEN];
     fill_header(final_frame, FN_FINAL,
-                ADDR_RESP_LO, ADDR_RESP_HI,
+                s_peer_addr_lo, s_peer_addr_hi,
                 s_my_addr_lo, s_my_addr_hi);
     ts_to_frame(&final_frame[FINAL_POLL_TX_TS_IDX],  poll_tx_ts);
     ts_to_frame(&final_frame[FINAL_RESP_RX_TS_IDX],  resp_rx_ts);
@@ -807,15 +812,26 @@ static esp_err_t responder_cycle(uwb_range_result_t *result)
 /* Public API                                                             */
 /* --------------------------------------------------------------------- */
 
-esp_err_t uwb_init(uwb_role_t role, int mosi, int miso, int sclk, int cs, int rst)
+esp_err_t uwb_init(uwb_role_t role,
+                   char responder_addr_suffix,
+                   int mosi, int miso, int sclk, int cs, int rst)
 {
     s_role = role;
+
+    /* Validate / normalise the responder suffix. Accept 'A'..'I' (9 max).
+     * Anything else (including 0) becomes the default 'A'. */
+    char suffix = responder_addr_suffix;
+    if (suffix < 'A' || suffix > 'I') suffix = DEFAULT_RESP_SUFFIX;
+
     if (role == UWB_ROLE_INITIATOR) {
-        s_my_addr_lo   = ADDR_INIT_LO; s_my_addr_hi   = ADDR_INIT_HI;
-        s_peer_addr_lo = ADDR_RESP_LO; s_peer_addr_hi = ADDR_RESP_HI;
+        s_my_addr_lo   = ADDR_INIT_LO;     s_my_addr_hi   = ADDR_INIT_HI;
+        /* Peer addr will be set per-cycle by uwb_perform_ranging. Initialise
+         * to the default (single-peer compatibility) so logs read sensibly
+         * before the first ranging call. */
+        s_peer_addr_lo = ADDR_RESP_PREFIX; s_peer_addr_hi = DEFAULT_RESP_SUFFIX;
     } else {
-        s_my_addr_lo   = ADDR_RESP_LO; s_my_addr_hi   = ADDR_RESP_HI;
-        s_peer_addr_lo = ADDR_INIT_LO; s_peer_addr_hi = ADDR_INIT_HI;
+        s_my_addr_lo   = ADDR_RESP_PREFIX; s_my_addr_hi   = suffix;
+        s_peer_addr_lo = ADDR_INIT_LO;     s_peer_addr_hi = ADDR_INIT_HI;
     }
     ESP_LOGI(TAG, "Init UWB role=%s addr=%c%c peer=%c%c (DS-TWR)",
              role == UWB_ROLE_INITIATOR ? "initiator" : "responder",
@@ -846,7 +862,7 @@ esp_err_t uwb_init(uwb_role_t role, int mosi, int miso, int sclk, int cs, int rs
     return ESP_OK;
 }
 
-esp_err_t uwb_perform_ranging(uwb_range_result_t *result)
+esp_err_t uwb_perform_ranging(char peer_addr_suffix, uwb_range_result_t *result)
 {
     if (result) {
         result->valid          = false;
@@ -855,7 +871,22 @@ esp_err_t uwb_perform_ranging(uwb_range_result_t *result)
         result->peer_imu_valid = false;
         /* Don't bother zeroing result->peer_imu — meaningless when invalid. */
     }
-    if (s_role == UWB_ROLE_INITIATOR) return initiator_cycle(result);
+
+    if (s_role == UWB_ROLE_INITIATOR) {
+        /* Validate the peer suffix; fall back to default if junk. The
+         * responder ignores peer_addr_suffix entirely (it only ever
+         * talks to the single initiator 'VE'). */
+        char suffix = peer_addr_suffix;
+        if (suffix < 'A' || suffix > 'I') suffix = DEFAULT_RESP_SUFFIX;
+
+        /* Latch the per-cycle peer addr into the module-static fields that
+         * fill_header and header_ok read. This is safe because
+         * uwb_perform_ranging is called serially from a single task. */
+        s_peer_addr_lo = ADDR_RESP_PREFIX;
+        s_peer_addr_hi = (uint8_t)suffix;
+
+        return initiator_cycle(result);
+    }
     return responder_cycle(result);
 }
 

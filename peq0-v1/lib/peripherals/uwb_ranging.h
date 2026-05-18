@@ -28,22 +28,26 @@ typedef struct {
     bool          peer_imu_valid;
 } uwb_range_result_t;
 
-esp_err_t uwb_init(uwb_role_t role, int mosi, int miso, int sclk, int cs, int rst);
+/* Initialise UWB. For UWB_ROLE_RESPONDER, the responder's own address
+ * suffix is 'A'..'I' for boards WA..WI. Pass 0 to use the default 'A'.
+ * Initiator ignores responder_addr_suffix. */
+esp_err_t uwb_init(uwb_role_t role,
+                   char responder_addr_suffix,
+                   int mosi, int miso, int sclk, int cs, int rst);
 
 /* Performs one DS-TWR cycle.
  *
+ * On the initiator, peer_addr_suffix selects which responder to talk to
+ * ('A'..'I' for WA..WI). The responder ignores these parameters.
+ *
  * Four-frame exchange:
  *   Initiator:  Poll TX -> Response RX -> Final TX (with timestamps) -> Report RX
- *   Responder:  Poll RX -> Response TX -> Final RX (read timestamps,
- *                 compute DS-TWR ToF) -> Report TX (with distance + IMU)
- *
- * The Report frame carries the responder's most recently published IMU
- * sample (see uwb_publish_local_imu). The initiator receives that sample
- * in result->peer_imu when result->valid is true.
+ *   Responder:  Poll RX (only if addressed to us) -> Response TX -> Final RX
+ *                -> compute DS-TWR ToF -> Report TX (with distance + IMU)
  *
  * Returns ESP_OK whether or not the cycle completed end-to-end — check
  * result->valid for that. Returns an error only on driver/SPI failure. */
-esp_err_t uwb_perform_ranging(uwb_range_result_t *result);
+esp_err_t uwb_perform_ranging(char peer_addr_suffix, uwb_range_result_t *result);
 
 /* Publish the local IMU sample so the responder can embed it in the next
  * Report frame. Should be called from whatever task produces IMU samples

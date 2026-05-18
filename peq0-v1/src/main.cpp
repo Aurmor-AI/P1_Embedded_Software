@@ -25,9 +25,20 @@ static const char *TAG = "main";
 #define PIN_SDA  22
 #define PIN_SCL  23
 
-// Set this per-board: one as INITIATOR, the other as RESPONDER.
-// Flash the same firmware to both and just change this define.
-#define MY_UWB_ROLE  UWB_ROLE_INITIATOR  // UWB_ROLE_RESPONDER or UWB_ROLE_INITIATOR
+// Set this per-board: one as INITIATOR, the others as RESPONDER.
+// Flash the same firmware to all boards and change MY_UWB_ROLE plus,
+// for responders, MY_RESPONDER_SUFFIX ('A'..'I' for up to 9 responders).
+#define MY_UWB_ROLE         UWB_ROLE_INITIATOR  // UWB_ROLE_RESPONDER or UWB_ROLE_INITIATOR
+#define MY_RESPONDER_SUFFIX 'A'                 // 'A'..'I', ignored for initiator
+
+// Initiator: which responders to range against, in cycle order. List
+// only the suffix character; the full address is "W<suffix>". The
+// initiator round-robins through this list, one peer per cycle.
+//
+// For Step 1 we keep a single entry to preserve current behavior. Later
+// steps will populate this with the full set.
+static const char s_initiator_peer_list[] = { 'A' };
+#define INITIATOR_PEER_COUNT (sizeof(s_initiator_peer_list) / sizeof(s_initiator_peer_list[0]))
 
 // Sampling and reporting rates
 #define IMU_SAMPLE_HZ     200
@@ -252,10 +263,19 @@ static void uwb_task(void *arg)
 
     TickType_t next = xTaskGetTickCount();
     int        consecutive_fails = 0;
+    size_t     peer_idx = 0;   // Round-robin index into s_initiator_peer_list
 
     while (true) {
         uwb_range_result_t r;
-        esp_err_t err = uwb_perform_ranging(&r);
+        char peer_suffix;
+        if (MY_UWB_ROLE == UWB_ROLE_INITIATOR) {
+            peer_suffix = s_initiator_peer_list[peer_idx];
+            peer_idx = (peer_idx + 1) % INITIATOR_PEER_COUNT;
+        } else {
+            peer_suffix = 0;  // Ignored by responder cycle
+        }
+
+        esp_err_t err = uwb_perform_ranging(peer_suffix, &r);
 
         if (err == ESP_OK && r.valid) {
             range_publish(&r);
@@ -306,7 +326,8 @@ extern "C" void app_main(void)
     boot_reset_peripherals();
 
     // --- UWB ---
-    if (uwb_init(MY_UWB_ROLE, PIN_MOSI, PIN_MISO, PIN_SCLK, PIN_CS, PIN_RST) != ESP_OK) {
+    if (uwb_init(MY_UWB_ROLE, MY_RESPONDER_SUFFIX,
+                 PIN_MOSI, PIN_MISO, PIN_SCLK, PIN_CS, PIN_RST) != ESP_OK) {
         ESP_LOGE(TAG, "UWB init failed");
         return;
     }
