@@ -35,52 +35,114 @@ static const char *TAG = "main";
 // only the suffix character; the full address is "W<suffix>". The
 // initiator round-robins through this list, one peer per cycle.
 //
-// For Step 1 we keep a single entry to preserve current behavior. Later
-// steps will populate this with the full set.
-static const char s_initiator_peer_list[] = { 'A' };
+// Set this to the list of responders you've actually flashed. Unflashed
+// suffixes will just time out and be marked stale — harmless but wasteful
+// of cycle time.
+// Initiator = Head
+// A = Chest/Waist
+// B = Left Elbow (above elbow)
+// C = Right Elbow (above elbow)
+// D = Left Wrist
+// E = Right Wrist
+// F = Left Knee (above knee)
+// G = Right Knee (above knee)
+// H = Left ankle
+// I = Right ankle
+static const char s_initiator_peer_list[] = {
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'
+};
 #define INITIATOR_PEER_COUNT (sizeof(s_initiator_peer_list) / sizeof(s_initiator_peer_list[0]))
 
-// Sampling and reporting rates
+// Sampling and reporting rates. With 9 peers, UWB_RANGE_HZ is the
+// *total* round-robin rate; per-peer rate is UWB_RANGE_HZ / N_PEERS.
+// 30 Hz total / 9 peers = ~3.3 Hz per peer.
 #define IMU_SAMPLE_HZ     200
 #define IMU_PRINT_HZ      10
-#define UWB_RANGE_HZ      10
+#define UWB_RANGE_HZ      30
 
 #define IMU_SAMPLE_PERIOD_US (1000000 / IMU_SAMPLE_HZ)
 #define IMU_PRINT_PERIOD_MS  (1000 / IMU_PRINT_HZ)
 #define UWB_PERIOD_MS        (1000 / UWB_RANGE_HZ)
 
 // ---------------------------------------------------------------------------
-// Shared state — UWB task writes, IMU task reads.
+// Per-peer state table (initiator only).
 //
-// Protected by a portMUX_TYPE spinlock. The struct is small and contention
-// is essentially zero (UWB writes at 10 Hz, IMU reads at 10 Hz), so a
-// spinlock is faster and simpler than a mutex and never blocks.
+// Indexed by position in s_initiator_peer_list, NOT by ASCII value of
+// the suffix. So peer slot 0 holds whatever responder is at
+// s_initiator_peer_list[0], etc.
 //
-// The struct now also carries the peer's IMU sample (piggybacked on the
-// Report frame from the responder). Initiator-side: peer_imu_valid will
-// be set after the first successful range cycle that includes IMU bytes.
-// Responder-side: peer_imu_valid stays false (we are the IMU source).
+// Each slot holds the most recent ranging result for that peer, when it
+// was captured, and a small failure counter. Stale slots (no update in
+// PEER_STALE_MS) are flagged in the snapshot so consumers can ignore
+// them.
+//
+// Protected by a portMUX_TYPE spinlock. Contention is low (the UWB task
+// writes one slot per round-robin cycle, the print task reads everything
+// once per print interval), and a spinlock never blocks.
 // ---------------------------------------------------------------------------
-static uwb_range_result_t s_last_range = { /* zero-init all fields */ };
-static portMUX_TYPE       s_range_lock = portMUX_INITIALIZER_UNLOCKED;
+#define PEER_STALE_MS  500   // Slot is stale if no update in this many ms
 
-static inline void range_publish(const uwb_range_result_t *r) {
-    portENTER_CRITICAL(&s_range_lock);
-    s_last_range = *r;
-    portEXIT_CRITICAL(&s_range_lock);
+typedef struct {
+    uwb_range_result_t result;       // distance + peer_imu (when .valid)
+    int64_t            last_ok_us;   // Wall clock of most recent successful update
+    uint32_t           ok_count;     // Cumulative successful cycles for this peer
+    uint32_t           miss_count;   // Cumulative consecutive missed cycles
+} peer_state_t;
+
+static peer_state_t   s_peer_state[INITIATOR_PEER_COUNT] = {};
+static portMUX_TYPE   s_peer_lock = portMUX_INITIALIZER_UNLOCKED;
+
+// Responder-side shared state: this device's last "range from initiator".
+// Single slot (one initiator, one responder = one relationship). The
+// responder cycle writes this; the print task on the responder reads it.
+// Initiator does not use s_self_range.
+static uwb_range_result_t s_self_range = {};
+static portMUX_TYPE       s_self_lock  = portMUX_INITIALIZER_UNLOCKED;
+
+static inline void peer_state_publish(size_t idx, const uwb_range_result_t *r) {
+    if (idx >= INITIATOR_PEER_COUNT) return;
+    int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_peer_lock);
+    s_peer_state[idx].result     = *r;
+    s_peer_state[idx].last_ok_us = now;
+    s_peer_state[idx].ok_count++;
+    s_peer_state[idx].miss_count = 0;
+    portEXIT_CRITICAL(&s_peer_lock);
 }
 
-static inline void range_invalidate(void) {
-    portENTER_CRITICAL(&s_range_lock);
-    s_last_range.valid = false;
-    portEXIT_CRITICAL(&s_range_lock);
+static inline void peer_state_record_miss(size_t idx) {
+    if (idx >= INITIATOR_PEER_COUNT) return;
+    portENTER_CRITICAL(&s_peer_lock);
+    s_peer_state[idx].miss_count++;
+    portEXIT_CRITICAL(&s_peer_lock);
 }
 
-static inline uwb_range_result_t range_snapshot(void) {
+static inline void peer_state_snapshot(peer_state_t *out) {
+    portENTER_CRITICAL(&s_peer_lock);
+    for (size_t i = 0; i < INITIATOR_PEER_COUNT; i++) {
+        out[i] = s_peer_state[i];
+    }
+    portEXIT_CRITICAL(&s_peer_lock);
+}
+
+// Convenience for responder side — same pattern but a single slot.
+static inline void self_range_publish(const uwb_range_result_t *r) {
+    portENTER_CRITICAL(&s_self_lock);
+    s_self_range = *r;
+    portEXIT_CRITICAL(&s_self_lock);
+}
+
+static inline void self_range_invalidate(void) {
+    portENTER_CRITICAL(&s_self_lock);
+    s_self_range.valid = false;
+    portEXIT_CRITICAL(&s_self_lock);
+}
+
+static inline uwb_range_result_t self_range_snapshot(void) {
     uwb_range_result_t r;
-    portENTER_CRITICAL(&s_range_lock);
-    r = s_last_range;
-    portEXIT_CRITICAL(&s_range_lock);
+    portENTER_CRITICAL(&s_self_lock);
+    r = s_self_range;
+    portEXIT_CRITICAL(&s_self_lock);
     return r;
 }
 
@@ -203,10 +265,21 @@ static void imu_print_task(void *arg)
             continue;
         }
 
-        uwb_range_result_t r = range_snapshot();
+        // Build the range column. On the responder, this is just the
+        // distance to the (one and only) initiator. On the initiator, we
+        // pick a peer to show on the main line and dump a per-peer
+        // summary line below (rotating which peer's IMU we detail, so
+        // every peer gets shown roughly once per N print intervals).
         char range_str[16];
-        if (r.valid) snprintf(range_str, sizeof(range_str), "%7.3f", r.distance_m);
-        else         snprintf(range_str, sizeof(range_str), "   ---");
+        if (MY_UWB_ROLE == UWB_ROLE_INITIATOR) {
+            // For the main line: show the most recently-updated peer's
+            // distance, or "---" if no peer has reported in.
+            snprintf(range_str, sizeof(range_str), "   ---");
+        } else {
+            uwb_range_result_t sr = self_range_snapshot();
+            if (sr.valid) snprintf(range_str, sizeof(range_str), "%7.3f", sr.distance_m);
+            else          snprintf(range_str, sizeof(range_str), "   ---");
+        }
 
         int64_t now_ms = esp_timer_get_time() / 1000;
         const lsm6_sample_t &p = window_peak_sample;
@@ -221,21 +294,59 @@ static void imu_print_task(void *arg)
                window_peak_g, all_time_peak_g,
                range_str);
 
-        // Peer IMU summary every ~1 s when present, to avoid cluttering
-        // the main per-print line. Computed from the most recent ranging
-        // cycle's piggybacked IMU sample. Skipped entirely on the
-        // responder (no peer IMU to display).
-        static int peer_print_counter = 0;
-        if (++peer_print_counter >= IMU_PRINT_HZ) {
-            peer_print_counter = 0;
-            if (r.peer_imu_valid) {
-                const lsm6_sample_t &q = r.peer_imu;
-                float peer_high_g = sqrtf(q.hx_g*q.hx_g + q.hy_g*q.hy_g + q.hz_g*q.hz_g);
-                printf("# peer IMU: ax=%+.3f ay=%+.3f az=%+.3f  "
-                       "h|=%.2fg  gz=%+.2f dps  T=%.1f\n",
-                       q.ax_g, q.ay_g, q.az_g,
-                       peer_high_g,
-                       q.gz_dps, q.temp_c);
+        // Initiator: dump compact all-peer distance grid every ~500 ms
+        // (5 print intervals), plus rotate through peers' IMU detail one
+        // per print iteration so every peer's IMU shows up over time.
+        if (MY_UWB_ROLE == UWB_ROLE_INITIATOR) {
+            static int peer_grid_counter = 0;
+            static size_t peer_rotate_idx = 0;
+
+            peer_state_t snap[INITIATOR_PEER_COUNT];
+            peer_state_snapshot(snap);
+            int64_t now_us = esp_timer_get_time();
+
+            if (++peer_grid_counter >= IMU_PRINT_HZ / 2) {  // ~2 Hz
+                peer_grid_counter = 0;
+                // Compact distance grid: one line, all 9 peers.
+                printf("# peers:");
+                for (size_t i = 0; i < INITIATOR_PEER_COUNT; i++) {
+                    char  suffix   = s_initiator_peer_list[i];
+                    int64_t age_ms = (now_us - snap[i].last_ok_us) / 1000;
+                    bool    fresh  = snap[i].result.valid && age_ms < PEER_STALE_MS;
+                    if (fresh) {
+                        printf("  W%c=%+5.2f", suffix, snap[i].result.distance_m);
+                    } else {
+                        printf("  W%c=  ---", suffix);
+                    }
+                }
+                printf("\n");
+            }
+
+            // Per-print rotation: show one peer's IMU detail. Skip stale
+            // slots silently and try the next one until we find one with
+            // fresh IMU or we've walked the whole list.
+            for (size_t tries = 0; tries < INITIATOR_PEER_COUNT; tries++) {
+                size_t i = peer_rotate_idx;
+                peer_rotate_idx = (peer_rotate_idx + 1) % INITIATOR_PEER_COUNT;
+                int64_t age_ms = (now_us - snap[i].last_ok_us) / 1000;
+                if (snap[i].result.peer_imu_valid &&
+                    snap[i].result.valid &&
+                    age_ms < PEER_STALE_MS) {
+                    const lsm6_sample_t &q = snap[i].result.peer_imu;
+                    float h = sqrtf(q.hx_g*q.hx_g + q.hy_g*q.hy_g + q.hz_g*q.hz_g);
+                    printf("# W%c: d=%+.3fm  ax=%+.2f ay=%+.2f az=%+.2f  "
+                           "h|=%.2fg  gz=%+.1f dps  T=%.1f  "
+                           "ok=%lu miss=%lu age=%lldms\n",
+                           s_initiator_peer_list[i],
+                           snap[i].result.distance_m,
+                           q.ax_g, q.ay_g, q.az_g,
+                           h,
+                           q.gz_dps, q.temp_c,
+                           (unsigned long)snap[i].ok_count,
+                           (unsigned long)snap[i].miss_count,
+                           (long long)age_ms);
+                    break;
+                }
             }
         }
 
@@ -262,29 +373,41 @@ static void uwb_task(void *arg)
              MY_UWB_ROLE == UWB_ROLE_INITIATOR ? "initiator" : "responder");
 
     TickType_t next = xTaskGetTickCount();
-    int        consecutive_fails = 0;
-    size_t     peer_idx = 0;   // Round-robin index into s_initiator_peer_list
+    size_t     peer_idx = 0;                       // Initiator round-robin index
+    int        responder_fails = 0;                // Consecutive misses on the responder
 
     while (true) {
         uwb_range_result_t r;
-        char peer_suffix;
+        char   peer_suffix;
+        size_t this_idx = 0;
+
         if (MY_UWB_ROLE == UWB_ROLE_INITIATOR) {
-            peer_suffix = s_initiator_peer_list[peer_idx];
-            peer_idx = (peer_idx + 1) % INITIATOR_PEER_COUNT;
+            this_idx     = peer_idx;
+            peer_suffix  = s_initiator_peer_list[this_idx];
+            peer_idx     = (peer_idx + 1) % INITIATOR_PEER_COUNT;
         } else {
-            peer_suffix = 0;  // Ignored by responder cycle
+            peer_suffix  = 0;  // Ignored by responder cycle
         }
 
         esp_err_t err = uwb_perform_ranging(peer_suffix, &r);
 
-        if (err == ESP_OK && r.valid) {
-            range_publish(&r);
-            consecutive_fails = 0;
+        if (MY_UWB_ROLE == UWB_ROLE_INITIATOR) {
+            if (err == ESP_OK && r.valid) {
+                peer_state_publish(this_idx, &r);
+            } else {
+                peer_state_record_miss(this_idx);
+            }
         } else {
-            consecutive_fails++;
-            if (consecutive_fails == 5) {
-                range_invalidate();
-                ESP_LOGW(TAG, "5 consecutive ranging failures, marking invalid");
+            // Responder side: same logic as before, single slot
+            if (err == ESP_OK && r.valid) {
+                self_range_publish(&r);
+                responder_fails = 0;
+            } else {
+                responder_fails++;
+                if (responder_fails == 5) {
+                    self_range_invalidate();
+                    ESP_LOGW(TAG, "5 consecutive ranging failures, marking invalid");
+                }
             }
         }
 
